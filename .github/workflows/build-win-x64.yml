@@ -22,6 +22,7 @@ jobs:
 
       - name: Get version
         id: get_version
+        shell: bash
         env:
           RELEASE_INPUT_VERSION: ${{ github.event.inputs.version }}
           RELEASE_REF: ${{ github.ref }}
