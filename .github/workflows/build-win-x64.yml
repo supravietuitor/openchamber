@@ -4,7 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 1.18.1)'
+        description: 'Version to release'
+        required: false
+        type: string
+      opencode_run_id:
+        description: 'OpenCode CI run ID for the custom CLI artifact'
         required: false
         type: string
   push:
@@ -13,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build-win-x64:
@@ -46,6 +51,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Download custom OpenCode CLI
+        if: ${{ inputs.opencode_run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.opencode_run_id }}" \
+            --repo supravietuitor/opencode \
+            --name opencode-windows-custom \
+            --dir custom-opencode-cli
+
       - name: Get bundled OpenCode CLI version
         id: opencode_cli_version
         shell: bash
@@ -68,6 +84,8 @@ jobs:
       - name: Prepare bundled OpenCode CLI
         working-directory: packages/electron
         shell: bash
+        env:
+          OPENCHAMBER_OPENCODE_CLI_PATH: ${{ inputs.opencode_run_id != '' && format('{0}/custom-opencode-cli/opencode.exe', github.workspace) || '' }}
         run: |
           bun run prepare:opencode-cli
           bun run verify:opencode-cli
