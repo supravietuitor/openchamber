@@ -12,6 +12,10 @@ function message(id: string, sessionID = "ses_1"): Message {
   return { id, sessionID, role: "assistant", time: { created: 1 } } as Message
 }
 
+function completedMessage(id: string, parentID: string, sessionID = "ses_1"): Message {
+  return { id, sessionID, role: "assistant", parentID, time: { created: 1, completed: 2 } } as Message
+}
+
 function userMessage(id: string, sessionID = "ses_1"): Message {
   return { id, sessionID, role: "user", time: { created: 1 } } as Message
 }
@@ -55,6 +59,21 @@ describe("materializeSessionSnapshots", () => {
     expect(result.part.msg_1.map((item) => item.id)).toEqual(["prt_1"])
     expect(result.messagesChanged).toBe(true)
     expect(result.partsChanged).toBe(true)
+  })
+
+  test("filters completed exact assistant duplicates with the same parent", () => {
+    const result = materializeSessionSnapshots(
+      { message: {}, part: {} },
+      "ses_1",
+      [
+        { info: completedMessage("msg_1", "user_1"), parts: [part("prt_1", "msg_1", "text", "same answer")] },
+        { info: completedMessage("msg_2", "user_1"), parts: [part("prt_2", "msg_2", "text", "same answer")] },
+        { info: completedMessage("msg_3", "user_2"), parts: [part("prt_3", "msg_3", "text", "same answer")] },
+      ],
+    )
+
+    expect(result.messages.map((item) => item.id)).toEqual(["msg_1", "msg_3"])
+    expect(result.part.msg_2).toBe(undefined)
   })
 
   test("preserves unchanged references", () => {

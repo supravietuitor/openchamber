@@ -3,6 +3,7 @@ import type { Session } from "@opencode-ai/sdk/v2"
 import type { Event, Message, Part, PermissionRequest, QuestionRequest, SessionStatus } from "@opencode-ai/sdk/v2/client"
 import { applyDirectoryEvent } from "../event-reducer"
 import { INITIAL_STATE, type State } from "../types"
+import { resetResponseIntegrityForTests, sanitizeResponseText } from "../response-integrity"
 
 function state(overrides: Partial<State> = {}): State {
   return {
@@ -128,6 +129,135 @@ describe("applyDirectoryEvent", () => {
       properties: { part: serverText },
     } as Event)).toBe(true)
     expect(draft.part.msg_1).toEqual([serverText, optimisticFile])
+  })
+
+  test("preserves legal prose containing pollution-like words", () => {
+    resetResponseIntegrityForTests()
+    const legalText = "The API returned invalid. The selector >xpath is documented, and Baebele is a proper name."
+    expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
+  })
+
+  test("requires a sentence boundary before a pollution tail", () => {
+    resetResponseIntegrityForTests()
+    expect(sanitizeResponseText("讨论六合彩的历史。这里没有广告内容。")).toEqual({
+      text: "讨论六合彩的历史。这里没有广告内容。",
+      polluted: false,
+      internalLeak: false,
+    })
+  })
+
+  test("preserves normal English control-flow prose", () => {
+    resetResponseIntegrityForTests()
+    const legalText = "The build failed. No final artifact was generated, so stop the export and review the logs."
+    expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
+  })
+
+  test("filters an internal-loop leak without persisting the assistant message", () => {
+    resetResponseIntegrityForTests()
+    const draft = state({
+      message: { ses_1: [{ id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
+      part: { msg_leak: [{ id: "prt_leak", messageID: "msg_leak", sessionID: "ses_1", type: "text", text: "I failed.\nThis is clearly a system loop.\nNo final." } as Part] },
+    })
+
+    expect(applyDirectoryEvent(draft, {
+      type: "message.part.updated",
+      properties: { sessionID: "ses_1", part: draft.part.msg_leak[0] },
+    } as Event)).toBe(true)
+    expect(draft.message.ses_1).toEqual([])
+    expect(draft.part.msg_leak).toBe(undefined)
+
+    expect(applyDirectoryEvent(draft, {
+      type: "message.updated",
+      properties: { info: { id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } },
+    } as Event)).toBe(false)
+  })
+
+  test("filters an internal-loop leak split across deltas", () => {
+    resetResponseIntegrityForTests()
+    const draft = state({
+      message: { ses_1: [{ id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
+      part: { msg_leak: [{ id: "prt_leak", messageID: "msg_leak", sessionID: "ses_1", type: "text", text: "状态。" } as Part] },
+    })
+
+    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_leak", partID: "prt_leak", field: "text", delta: "This is clearly a " } } as Event)).toBe(true)
+    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_leak", partID: "prt_leak", field: "text", delta: "system loop." } } as Event)).toBe(true)
+    expect((draft.part.msg_leak[0] as { text: string }).text).toBe("状态。")
+  })
+
+  test("filters known pollution from text deltas", () => {
+    resetResponseIntegrityForTests()
+    const draft = state({
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "已完成。" } as Part] },
+    })
+
+    expect(applyDirectoryEvent(draft, {
+      type: "message.part.delta",
+      properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "_久久爱" },
+    } as Event)).toBe(false)
+    expect((draft.part.msg_1[0] as { text: string }).text).toBe("已完成。")
+  })
+
+  test("filters pollution split across deltas", () => {
+    resetResponseIntegrityForTests()
+    const draft = state({
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "结果。" } as Part] },
+    })
+
+    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "geek" } } as Event)).toBe(true)
+    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "y?" } } as Event)).toBe(true)
+    expect((draft.part.msg_1[0] as { text: string }).text).toBe("结果。")
+  })
+
+  test("rejects deltas after a completed assistant message", () => {
+    resetResponseIntegrityForTests()
+    const draft = state({
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "完成" } as Part] },
+    })
+
+    expect(applyDirectoryEvent(draft, deltaEvent())).toBe(false)
+    expect((draft.part.msg_1[0] as { text: string }).text).toBe("完成")
+  })
+
+  test("removes a repeated completed assistant response", () => {
+    resetResponseIntegrityForTests()
+    const text = "刚才确实出现了回复重复发送异常，抱歉。实际工作已经完成。"
+    const first = state({
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+    expect(applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)).toBe(true)
+
+    const second = state({
+      message: { ses_1: [
+        first.message.ses_1[0],
+        { id: "msg_2", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 3, completed: 4 } } as never,
+      ] },
+      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+    expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
+    expect(second.message.ses_1.map((message) => message.id)).toEqual(["msg_1"])
+  })
+
+  test("resets duplicate-response memory when a session is deleted", () => {
+    resetResponseIntegrityForTests()
+    const text = "这是一段足够长的正常响应，用于验证 session 删除后的状态重置。"
+    const first = state({
+      session: [buildSession("session", { created: 1, updated: 1 })],
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+    applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)
+    applyDirectoryEvent(first, { type: "session.deleted", properties: { sessionID: "ses_1" } } as Event)
+
+    const next = state({
+      message: { ses_1: [{ id: "msg_2", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 3, completed: 4 } } as never] },
+      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+    expect(applyDirectoryEvent(next, { type: "message.part.updated", properties: { sessionID: "ses_1", part: next.part.msg_2[0] } } as Event)).toBe(true)
+    expect(next.message.ses_1).toHaveLength(1)
   })
 
   test("returns typed materialization when delta arrives before parts", () => {

@@ -98,6 +98,39 @@ function filterMaterializedParts(parts: Part[], skipPartTypes: ReadonlySet<strin
     .filter((part) => !!part?.id && !skipPartTypes.has(part.type))
 }
 
+function completedAssistantDuplicateKey(message: Message, parts: Part[]): string | undefined {
+  if (message.role !== "assistant" || !(message.time?.completed && message.time.completed > 0)) return undefined
+  const parentID = typeof message.parentID === "string" ? message.parentID : ""
+  if (!parentID) return undefined
+  const text = parts
+    .filter((part) => part.type === "text")
+    .map((part) => String((part as { text?: unknown }).text ?? "").replace(/\r\n/g, "\n").trim())
+    .filter(Boolean)
+    .join("\n")
+  if (!text) return undefined
+  return `${parentID}\u0000${text}`
+}
+
+function removeMaterializedAssistantDuplicates(
+  messages: Message[],
+  partState: Record<string, Part[]>,
+): { messages: Message[]; part: Record<string, Part[]>; changed: boolean } {
+  const seen = new Set<string>()
+  const duplicateIDs = new Set<string>()
+  for (const message of messages) {
+    const key = completedAssistantDuplicateKey(message, partState[message.id] ?? [])
+    if (!key) continue
+    if (seen.has(key)) duplicateIDs.add(message.id)
+    else seen.add(key)
+  }
+  if (duplicateIDs.size === 0) return { messages, part: partState, changed: false }
+
+  const nextMessages = messages.filter((message) => !duplicateIDs.has(message.id))
+  const nextPart = { ...partState }
+  for (const messageID of duplicateIDs) delete nextPart[messageID]
+  return { messages: nextMessages, part: nextPart, changed: true }
+}
+
 function haveEquivalentPartSnapshots(left: Part[] | undefined, right: Part[]): boolean {
   // `undefined` means "parts never fetched", which is NOT equivalent to a
   // fetched-empty snapshot — the empty array must be committed so
@@ -284,8 +317,8 @@ export function materializeSessionSnapshots(
     if (reconciledCurrentMessages === currentMessages) reconciledCurrentMessages = [...currentMessages]
     reconciledCurrentMessages[index] = incoming
   }
-  const messages = mergeMessages(reconciledCurrentMessages, nextMessages)
-  const messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
+  let messages = mergeMessages(reconciledCurrentMessages, nextMessages)
+  let messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
 
   let partsChanged = false
   let nextPartState = state.part
@@ -322,6 +355,14 @@ export function materializeSessionSnapshots(
       // the ensure-renderable effects retry syncSession forever.
       nextPartState[messageID] = nextParts
     }
+    partsChanged = true
+  }
+
+  const duplicateResult = removeMaterializedAssistantDuplicates(messages, nextPartState)
+  if (duplicateResult.changed) {
+    messages = duplicateResult.messages
+    nextPartState = duplicateResult.part
+    messagesChanged = true
     partsChanged = true
   }
 

@@ -20,6 +20,7 @@ import {
   findMessageIndex,
   insertMessageChronologically,
 } from "./message-ordering"
+import { appendSanitizedDelta, blockResponseMessage, clearResponseIntegrity, isDuplicateCompletedResponse, isResponseMessageBlocked, sanitizeResponseText } from "./response-integrity"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const DELTA_OVERLAP_FIELDS = ["text", "output"] as const
@@ -188,6 +189,39 @@ function hasMessage(draft: State, sessionID: string | undefined, messageID: stri
   return messages.some((message) => message.id === messageID)
 }
 
+function getMessage(draft: State, sessionID: string | undefined, messageID: string): Message | undefined {
+  const candidateLists = sessionID
+    ? [draft.message[sessionID]]
+    : Object.values(draft.message)
+  for (const messages of candidateLists) {
+    if (!messages) continue
+    const result = Binary.search(messages, messageID, (message) => message.id)
+    if (result.found) return messages[result.index]
+  }
+  return undefined
+}
+
+function isMessageCompleted(message: Message | undefined): boolean {
+  if (!message) return false
+  return Boolean(
+    (message as { finish?: unknown }).finish
+    || (message.time as { completed?: unknown } | undefined)?.completed,
+  )
+}
+
+function removeMessage(draft: State, sessionID: string | undefined, messageID: string): boolean {
+  if (!sessionID) return false
+  const messages = draft.message[sessionID]
+  if (!messages) return false
+  const result = Binary.search(messages, messageID, (message) => message.id)
+  if (!result.found) return false
+  const next = [...messages]
+  next.splice(result.index, 1)
+  draft.message[sessionID] = next
+  delete draft.part[messageID]
+  return true
+}
+
 export function reduceGlobalEvent(event: Event): GlobalEventResult {
   if (event.type === "global.disposed" || event.type === "server.connected") {
     return { type: "refresh" }
@@ -301,6 +335,7 @@ export function applyDirectoryEvent(
       const info = props.info ?? (result.found ? sessions[result.index] : undefined)
       if (result.found) sessions.splice(result.index, 1)
       cleanupSessionCaches(draft, sessionID, callbacks?.onSetSessionTodo)
+      clearResponseIntegrity(sessionID)
       if (!info?.parentID) draft.sessionTotal = Math.max(0, draft.sessionTotal - 1)
       markSessionEvent(sessionID, true)
       return true
@@ -353,6 +388,9 @@ export function applyDirectoryEvent(
 
     case "message.updated": {
       const info = (event.properties as { info: Message }).info
+      if (isResponseMessageBlocked(info.sessionID, info.id)) {
+        return false
+      }
       const messages = draft.message[info.sessionID]
       if (!messages) {
         draft.message[info.sessionID] = [info]
@@ -408,11 +446,38 @@ export function applyDirectoryEvent(
       const messageID = (part as { messageID?: string }).messageID
       const sessionID = props.sessionID ?? (part as { sessionID?: string }).sessionID
       if (!messageID) return false
+      const owner = getMessage(draft, sessionID, messageID)
+      const existingParts = draft.part[messageID]
+
+      let nextPart = part
+      if (part.type === "text") {
+        const field = "text"
+        const rawValue = (part as Record<string, unknown>)[field]
+        if (typeof rawValue === "string") {
+          const sanitized = sanitizeResponseText(rawValue)
+          if (sanitized.polluted) {
+            if (sanitized.internalLeak && sanitized.text.length === 0) {
+              blockResponseMessage(sessionID, messageID)
+              return removeMessage(draft, sessionID, messageID)
+            }
+            nextPart = { ...part, [field]: sanitized.text } as Part
+          }
+        }
+      }
+
+      if (owner?.role === "assistant") {
+        const text = (nextPart as Record<string, unknown>).text
+        if (typeof text === "string" && isDuplicateCompletedResponse(sessionID, messageID, text)) {
+          return removeMessage(draft, sessionID, messageID)
+        }
+      }
+
+      const effectivePart = nextPart
       const missingOwningMessage = !hasMessage(draft, sessionID, messageID)
-      const parts = draft.part[messageID]
+      const parts = existingParts
       if (!parts) {
         syncDebug.reducer.partUpdatedNoExistingParts(messageID, part.id, part.type)
-        draft.part[messageID] = [part]
+        draft.part[messageID] = [effectivePart]
         return missingOwningMessage
           ? {
             changed: true,
@@ -421,31 +486,31 @@ export function applyDirectoryEvent(
           : true
       }
       const next = [...parts]
-      const partIndex = next.findIndex((candidate) => candidate.id === part.id)
+      const partIndex = next.findIndex((candidate) => candidate.id === effectivePart.id)
       if (partIndex >= 0) {
         const previous = next[partIndex]
-        if (shouldPreserveExistingPart(previous, part)) {
+        if (shouldPreserveExistingPart(previous, effectivePart)) {
           return false
         }
-        const dedupeFields = getUpdatedDeltaFields(previous, part)
+        const dedupeFields = getUpdatedDeltaFields(previous, effectivePart)
         next[partIndex] = dedupeFields.length > 0
-          ? { ...part, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
-          : part
+          ? { ...effectivePart, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
+          : effectivePart
       } else {
         // Replace optimistic part (no sessionID) with server part of same type.
         // Gate: only scan if the first part lacks sessionID (optimistic parts are
         // always inserted first). Assistant messages never have optimistic parts,
         // so this check is effectively free during streaming.
         const hasOptimistic = next.length > 0 && !(next[0] as { sessionID?: string }).sessionID
-        const optimisticIndex = hasOptimistic && (part.type === "text" || part.type === "file")
-          ? next.findIndex((p) => p.type === part.type && !(p as { sessionID?: string }).sessionID)
+        const optimisticIdx = hasOptimistic && (effectivePart.type === "text" || effectivePart.type === "file")
+          ? next.findIndex((p) => p.type === effectivePart.type && !(p as { sessionID?: string }).sessionID)
           : -1
-        if (optimisticIndex >= 0) {
+        if (optimisticIdx >= 0) {
           // Replace in place: pushing to the end reorders text/file parts of a
           // just-sent message and remounts its rendered subtree.
-          next[optimisticIndex] = part
+          next[optimisticIdx] = effectivePart
         } else {
-          next.push(part)
+          next.push(effectivePart)
         }
       }
       draft.part[messageID] = next
@@ -501,13 +566,29 @@ export function applyDirectoryEvent(
       }
       const existing = parts[partIndex] as Record<string, unknown>
       const existingValue = existing[props.field] as string | undefined
+      const owner = getMessage(draft, props.sessionID, props.messageID)
+      if (isMessageCompleted(owner)) {
+        return false
+      }
       const dedupeFields = (existing as DedupeMetadata).__dedupeNextDeltaFields ?? []
       const shouldDedupe = dedupeFields.includes(props.field)
+      const sanitized = props.field === "text" || props.field === "output"
+        ? appendSanitizedDelta(existingValue, props.delta)
+        : { text: (existingValue ?? "") + props.delta, polluted: false, internalLeak: false }
+      if (sanitized.polluted && sanitized.text === existingValue) {
+        if (sanitized.internalLeak && sanitized.text.length === 0) {
+          blockResponseMessage(props.sessionID, props.messageID)
+          return removeMessage(draft, props.sessionID, props.messageID)
+        }
+        return false
+      }
       // Create new Part object + new array so React detects the change
       const next = [...parts]
       next[partIndex] = {
         ...existing,
-        [props.field]: shouldDedupe ? appendNonOverlappingDelta(existingValue, props.delta) : (existingValue ?? "") + props.delta,
+        [props.field]: shouldDedupe
+          ? appendNonOverlappingDelta(existingValue, props.delta)
+          : sanitized.text,
         __dedupeNextDeltaFields: dedupeFields.filter((field) => field !== props.field),
       } as unknown as Part
       draft.part[props.messageID] = next

@@ -408,6 +408,8 @@ export const registerOpenCodeProxy = (app, deps) => {
 
   const PROXY_REQUEST_TIMEOUT_MS = normalizeProxyTimeout(LONG_REQUEST_TIMEOUT_MS);
   const PROXY_TIMEOUT_MARKER = Symbol('openchamberProxyTimedOut');
+  const PROMPT_IDEMPOTENCY_TTL_MS = 15 * 60 * 1000;
+  const acceptedPromptIDs = new Map();
 
   // A provider OAuth callback blocks upstream for as long as the user takes to
   // sign in in their browser (device-code polling, or a loopback redirect), so
@@ -932,6 +934,67 @@ export const registerOpenCodeProxy = (app, deps) => {
   const apiProxy = createApiProxy(PROXY_REQUEST_TIMEOUT_MS);
   const interactiveOAuthProxy = createApiProxy(INTERACTIVE_OAUTH_TIMEOUT_MS);
 
+  // A transport timeout is ambiguous: the upstream prompt may already be
+  // running even though the browser did not receive its response. Keep the
+  // client-generated message ID claimed for a bounded window so a retry cannot
+  // start a second turn. Requests without messageID are background/internal
+  // continuations and intentionally remain outside this gate.
+  const promptIdempotencyGate = (req, res, next) => {
+    const messageID = typeof req.body?.messageID === 'string' ? req.body.messageID.trim() : '';
+    const sessionID = typeof req.params?.sessionID === 'string' ? req.params.sessionID : '';
+    if (!messageID || !sessionID) return next();
+
+    const directory = typeof req.headers?.['x-opencode-directory'] === 'string'
+      ? req.headers['x-opencode-directory']
+      : '';
+    const key = `${sessionID}\u0000${directory}\u0000${messageID}`;
+    const now = Date.now();
+    const existing = acceptedPromptIDs.get(key);
+    if (existing && existing > now) {
+      return res.status(202).json({ messageID, deduplicated: true });
+    }
+
+    const claim = now + PROMPT_IDEMPOTENCY_TTL_MS;
+    acceptedPromptIDs.set(key, claim);
+    const remember = () => {
+      acceptedPromptIDs.set(key, claim);
+      const timer = setTimeout(() => {
+        if (acceptedPromptIDs.get(key) === claim) acceptedPromptIDs.delete(key);
+      }, PROMPT_IDEMPOTENCY_TTL_MS);
+      timer.unref?.();
+    };
+
+    // Recover the claim after a proxy restart. The upstream has already
+    // persisted the user message when a previous prompt request was accepted.
+    // A failed probe is deliberately fail-open: it must not turn a temporary
+    // upstream read outage into a lost user send.
+    const encodedSessionID = encodeURIComponent(sessionID);
+    const encodedMessageID = encodeURIComponent(messageID);
+    const messageURL = buildOpenCodeUrl(`/session/${encodedSessionID}/message/${encodedMessageID}`, '')
+      + (directory ? `?directory=${encodeURIComponent(directory)}` : '');
+    fetch(messageURL, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...getOpenCodeAuthHeaders(),
+        ...(directory ? { 'x-opencode-directory': directory } : {}),
+      },
+      signal: AbortSignal.timeout(1500),
+    }).then((probe) => {
+      if (probe.ok && !res.headersSent && !res.writableEnded) {
+        remember();
+        res.status(202).json({ messageID, deduplicated: true });
+        return;
+      }
+      remember();
+      next();
+    }).catch(() => {
+      remember();
+      next();
+    });
+    return undefined;
+  };
+
   // Best-effort fallback for stale clients still sending symlink paths.
   // Settings and project selection normalize at source; this cached async path
   // avoids blocking the proxy hot path on every directory-scoped request.
@@ -948,6 +1011,7 @@ export const registerOpenCodeProxy = (app, deps) => {
   });
 
   app.use('/api', applyProxyResponseDeadline);
+  app.post('/api/session/:sessionID/prompt_async', promptIdempotencyGate);
   app.post('/api/provider/:providerID/oauth/callback', interactiveOAuthProxy);
   // OpenCode's native MCP OAuth flow: the request blocks until the user
   // finishes authorization in the browser (up to OpenCode's 5-minute callback
