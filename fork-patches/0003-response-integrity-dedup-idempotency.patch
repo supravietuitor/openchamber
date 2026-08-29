@@ -1,5 +1,5 @@
 diff --git a/packages/ui/src/sync/__tests__/event-reducer.test.ts b/packages/ui/src/sync/__tests__/event-reducer.test.ts
-index 2dda49141..af984c50d 100644
+index 2dda49141..c2e98ada9 100644
 --- a/packages/ui/src/sync/__tests__/event-reducer.test.ts
 +++ b/packages/ui/src/sync/__tests__/event-reducer.test.ts
 @@ -3,6 +3,7 @@ import type { Session } from "@opencode-ai/sdk/v2"
@@ -10,7 +10,7 @@ index 2dda49141..af984c50d 100644
  
  function state(overrides: Partial<State> = {}): State {
    return {
-@@ -130,6 +131,135 @@ describe("applyDirectoryEvent", () => {
+@@ -130,6 +131,158 @@ describe("applyDirectoryEvent", () => {
      expect(draft.part.msg_1).toEqual([serverText, optimisticFile])
    })
  
@@ -33,6 +33,12 @@ index 2dda49141..af984c50d 100644
 +    resetResponseIntegrityForTests()
 +    const legalText = "The build failed. No final artifact was generated, so stop the export and review the logs."
 +    expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
++  })
++
++  test("does not classify a standalone legal control-flow sentence as an internal leak", () => {
++    resetResponseIntegrityForTests()
++    expect(sanitizeResponseText("Stop.")).toEqual({ text: "", polluted: true, internalLeak: false })
++    expect(sanitizeResponseText("[END]")).toEqual({ text: "", polluted: true, internalLeak: false })
 +  })
 +
 +  test("filters an internal-loop leak without persisting the assistant message", () => {
@@ -124,6 +130,23 @@ index 2dda49141..af984c50d 100644
 +    expect(second.message.ses_1.map((message) => message.id)).toEqual(["msg_1"])
 +  })
 +
++  test("does not deduplicate incomplete streaming assistant responses", () => {
++    resetResponseIntegrityForTests()
++    const text = "这是一段仍在流式生成中的正常响应，不应因为内容相同而删除。"
++    const first = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    const second = state({
++      message: { ses_1: [{ id: "msg_2", sessionID: "ses_1", role: "assistant", time: { created: 2 } } as never] },
++      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++
++    expect(applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)).toBe(true)
++    expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
++    expect(second.message.ses_1).toHaveLength(1)
++  })
++
 +  test("resets duplicate-response memory when a session is deleted", () => {
 +    resetResponseIntegrityForTests()
 +    const text = "这是一段足够长的正常响应，用于验证 session 删除后的状态重置。"
@@ -184,7 +207,7 @@ index 192516326..fc2b4f958 100644
      const existingMessage = message("msg_1")
      const existingPart = part("prt_1", "msg_1")
 diff --git a/packages/ui/src/sync/event-reducer.ts b/packages/ui/src/sync/event-reducer.ts
-index 13057258d..2e95f9fb7 100644
+index 13057258d..1c454f9b3 100644
 --- a/packages/ui/src/sync/event-reducer.ts
 +++ b/packages/ui/src/sync/event-reducer.ts
 @@ -20,6 +20,7 @@ import {
@@ -276,7 +299,7 @@ index 13057258d..2e95f9fb7 100644
 +        }
 +      }
 +
-+      if (owner?.role === "assistant") {
++      if (owner?.role === "assistant" && isMessageCompleted(owner)) {
 +        const text = (nextPart as Record<string, unknown>).text
 +        if (typeof text === "string" && isDuplicateCompletedResponse(sessionID, messageID, text)) {
 +          return removeMessage(draft, sessionID, messageID)
@@ -439,10 +462,10 @@ index 89a653d25..adb4b8a29 100644
      part: partsChanged ? nextPartState : state.part,
 diff --git a/packages/ui/src/sync/response-integrity.ts b/packages/ui/src/sync/response-integrity.ts
 new file mode 100644
-index 000000000..1c0283ead
+index 000000000..24bea259d
 --- /dev/null
 +++ b/packages/ui/src/sync/response-integrity.ts
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,139 @@
 +// These signatures were observed only as unsolicited sentence-final tails.
 +// Requiring punctuation before the tail avoids filtering legitimate discussion
 +// of words such as "invalid" or selectors such as ">xpath" in normal prose.
@@ -481,6 +504,15 @@ index 000000000..1c0283ead
 +  },
 +]
 +
++const STRONG_INTERNAL_LEAK_PATTERNS = [
++  /\bThis is (?:clearly )?a system loop\b/iu,
++  /\bThis is analysis, not user visible\b/iu,
++  /\bI (?:need|must) (?:just )?stop producing tokens\b/iu,
++  /\bNo more channel calls\b/iu,
++  /\banalysis channel ongoing\b/iu,
++  /\b(?:the )?harness keeps generation\b/iu,
++]
++
 +const MAX_TRACKED_SESSIONS = 256
 +
 +type CompletedResponse = {
@@ -511,7 +543,7 @@ index 000000000..1c0283ead
 +  return {
 +    text: value.slice(0, firstMatch).trimEnd(),
 +    polluted: true,
-+    internalLeak,
++    internalLeak: internalLeak && STRONG_INTERNAL_LEAK_PATTERNS.some((pattern) => pattern.test(value)),
 +  }
 +}
 +

@@ -152,6 +152,12 @@ describe("applyDirectoryEvent", () => {
     expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
   })
 
+  test("does not classify a standalone legal control-flow sentence as an internal leak", () => {
+    resetResponseIntegrityForTests()
+    expect(sanitizeResponseText("Stop.")).toEqual({ text: "", polluted: true, internalLeak: false })
+    expect(sanitizeResponseText("[END]")).toEqual({ text: "", polluted: true, internalLeak: false })
+  })
+
   test("filters an internal-loop leak without persisting the assistant message", () => {
     resetResponseIntegrityForTests()
     const draft = state({
@@ -239,6 +245,23 @@ describe("applyDirectoryEvent", () => {
     })
     expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
     expect(second.message.ses_1.map((message) => message.id)).toEqual(["msg_1"])
+  })
+
+  test("does not deduplicate incomplete streaming assistant responses", () => {
+    resetResponseIntegrityForTests()
+    const text = "这是一段仍在流式生成中的正常响应，不应因为内容相同而删除。"
+    const first = state({
+      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
+      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+    const second = state({
+      message: { ses_1: [{ id: "msg_2", sessionID: "ses_1", role: "assistant", time: { created: 2 } } as never] },
+      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
+    })
+
+    expect(applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)).toBe(true)
+    expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
+    expect(second.message.ses_1).toHaveLength(1)
   })
 
   test("resets duplicate-response memory when a session is deleted", () => {

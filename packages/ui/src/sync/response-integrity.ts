@@ -36,6 +36,15 @@ const POLLUTION_PATTERNS = [
   },
 ]
 
+const STRONG_INTERNAL_LEAK_PATTERNS = [
+  /\bThis is (?:clearly )?a system loop\b/iu,
+  /\bThis is analysis, not user visible\b/iu,
+  /\bI (?:need|must) (?:just )?stop producing tokens\b/iu,
+  /\bNo more channel calls\b/iu,
+  /\banalysis channel ongoing\b/iu,
+  /\b(?:the )?harness keeps generation\b/iu,
+]
+
 const MAX_TRACKED_SESSIONS = 256
 
 type CompletedResponse = {
@@ -66,7 +75,7 @@ export function sanitizeResponseText(value: string): { text: string; polluted: b
   return {
     text: value.slice(0, firstMatch).trimEnd(),
     polluted: true,
-    internalLeak,
+    internalLeak: internalLeak && STRONG_INTERNAL_LEAK_PATTERNS.some((pattern) => pattern.test(value)),
   }
 }
 

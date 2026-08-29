@@ -465,7 +465,7 @@ export function applyDirectoryEvent(
         }
       }
 
-      if (owner?.role === "assistant") {
+      if (owner?.role === "assistant" && isMessageCompleted(owner)) {
         const text = (nextPart as Record<string, unknown>).text
         if (typeof text === "string" && isDuplicateCompletedResponse(sessionID, messageID, text)) {
           return removeMessage(draft, sessionID, messageID)
