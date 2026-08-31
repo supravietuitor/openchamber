@@ -1,0 +1,1382 @@
+diff --git a/packages/ui/src/sync/__tests__/event-reducer.test.ts b/packages/ui/src/sync/__tests__/event-reducer.test.ts
+index 2dda49141..c2e98ada9 100644
+--- a/packages/ui/src/sync/__tests__/event-reducer.test.ts
++++ b/packages/ui/src/sync/__tests__/event-reducer.test.ts
+@@ -3,6 +3,7 @@ import type { Session } from "@opencode-ai/sdk/v2"
+ import type { Event, Message, Part, PermissionRequest, QuestionRequest, SessionStatus } from "@opencode-ai/sdk/v2/client"
+ import { applyDirectoryEvent } from "../event-reducer"
+ import { INITIAL_STATE, type State } from "../types"
++import { resetResponseIntegrityForTests, sanitizeResponseText } from "../response-integrity"
+ 
+ function state(overrides: Partial<State> = {}): State {
+   return {
+@@ -130,6 +131,158 @@ describe("applyDirectoryEvent", () => {
+     expect(draft.part.msg_1).toEqual([serverText, optimisticFile])
+   })
+ 
++  test("preserves legal prose containing pollution-like words", () => {
++    resetResponseIntegrityForTests()
++    const legalText = "The API returned invalid. The selector >xpath is documented, and Baebele is a proper name."
++    expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
++  })
++
++  test("requires a sentence boundary before a pollution tail", () => {
++    resetResponseIntegrityForTests()
++    expect(sanitizeResponseText("讨论六合彩的历史。这里没有广告内容。")).toEqual({
++      text: "讨论六合彩的历史。这里没有广告内容。",
++      polluted: false,
++      internalLeak: false,
++    })
++  })
++
++  test("preserves normal English control-flow prose", () => {
++    resetResponseIntegrityForTests()
++    const legalText = "The build failed. No final artifact was generated, so stop the export and review the logs."
++    expect(sanitizeResponseText(legalText)).toEqual({ text: legalText, polluted: false, internalLeak: false })
++  })
++
++  test("does not classify a standalone legal control-flow sentence as an internal leak", () => {
++    resetResponseIntegrityForTests()
++    expect(sanitizeResponseText("Stop.")).toEqual({ text: "", polluted: true, internalLeak: false })
++    expect(sanitizeResponseText("[END]")).toEqual({ text: "", polluted: true, internalLeak: false })
++  })
++
++  test("filters an internal-loop leak without persisting the assistant message", () => {
++    resetResponseIntegrityForTests()
++    const draft = state({
++      message: { ses_1: [{ id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_leak: [{ id: "prt_leak", messageID: "msg_leak", sessionID: "ses_1", type: "text", text: "I failed.\nThis is clearly a system loop.\nNo final." } as Part] },
++    })
++
++    expect(applyDirectoryEvent(draft, {
++      type: "message.part.updated",
++      properties: { sessionID: "ses_1", part: draft.part.msg_leak[0] },
++    } as Event)).toBe(true)
++    expect(draft.message.ses_1).toEqual([])
++    expect(draft.part.msg_leak).toBe(undefined)
++
++    expect(applyDirectoryEvent(draft, {
++      type: "message.updated",
++      properties: { info: { id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } },
++    } as Event)).toBe(false)
++  })
++
++  test("filters an internal-loop leak split across deltas", () => {
++    resetResponseIntegrityForTests()
++    const draft = state({
++      message: { ses_1: [{ id: "msg_leak", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_leak: [{ id: "prt_leak", messageID: "msg_leak", sessionID: "ses_1", type: "text", text: "状态。" } as Part] },
++    })
++
++    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_leak", partID: "prt_leak", field: "text", delta: "This is clearly a " } } as Event)).toBe(true)
++    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_leak", partID: "prt_leak", field: "text", delta: "system loop." } } as Event)).toBe(true)
++    expect((draft.part.msg_leak[0] as { text: string }).text).toBe("状态。")
++  })
++
++  test("filters known pollution from text deltas", () => {
++    resetResponseIntegrityForTests()
++    const draft = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "已完成。" } as Part] },
++    })
++
++    expect(applyDirectoryEvent(draft, {
++      type: "message.part.delta",
++      properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "_久久爱" },
++    } as Event)).toBe(false)
++    expect((draft.part.msg_1[0] as { text: string }).text).toBe("已完成。")
++  })
++
++  test("filters pollution split across deltas", () => {
++    resetResponseIntegrityForTests()
++    const draft = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "结果。" } as Part] },
++    })
++
++    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "geek" } } as Event)).toBe(true)
++    expect(applyDirectoryEvent(draft, { type: "message.part.delta", properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "y?" } } as Event)).toBe(true)
++    expect((draft.part.msg_1[0] as { text: string }).text).toBe("结果。")
++  })
++
++  test("rejects deltas after a completed assistant message", () => {
++    resetResponseIntegrityForTests()
++    const draft = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text: "完成" } as Part] },
++    })
++
++    expect(applyDirectoryEvent(draft, deltaEvent())).toBe(false)
++    expect((draft.part.msg_1[0] as { text: string }).text).toBe("完成")
++  })
++
++  test("removes a repeated completed assistant response", () => {
++    resetResponseIntegrityForTests()
++    const text = "刚才确实出现了回复重复发送异常，抱歉。实际工作已经完成。"
++    const first = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    expect(applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)).toBe(true)
++
++    const second = state({
++      message: { ses_1: [
++        first.message.ses_1[0],
++        { id: "msg_2", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 3, completed: 4 } } as never,
++      ] },
++      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
++    expect(second.message.ses_1.map((message) => message.id)).toEqual(["msg_1"])
++  })
++
++  test("does not deduplicate incomplete streaming assistant responses", () => {
++    resetResponseIntegrityForTests()
++    const text = "这是一段仍在流式生成中的正常响应，不应因为内容相同而删除。"
++    const first = state({
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    const second = state({
++      message: { ses_1: [{ id: "msg_2", sessionID: "ses_1", role: "assistant", time: { created: 2 } } as never] },
++      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++
++    expect(applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)).toBe(true)
++    expect(applyDirectoryEvent(second, { type: "message.part.updated", properties: { sessionID: "ses_1", part: second.part.msg_2[0] } } as Event)).toBe(true)
++    expect(second.message.ses_1).toHaveLength(1)
++  })
++
++  test("resets duplicate-response memory when a session is deleted", () => {
++    resetResponseIntegrityForTests()
++    const text = "这是一段足够长的正常响应，用于验证 session 删除后的状态重置。"
++    const first = state({
++      session: [buildSession("session", { created: 1, updated: 1 })],
++      message: { ses_1: [{ id: "msg_1", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 1, completed: 2 } } as never] },
++      part: { msg_1: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    applyDirectoryEvent(first, { type: "message.part.updated", properties: { sessionID: "ses_1", part: first.part.msg_1[0] } } as Event)
++    applyDirectoryEvent(first, { type: "session.deleted", properties: { sessionID: "ses_1" } } as Event)
++
++    const next = state({
++      message: { ses_1: [{ id: "msg_2", sessionID: "ses_1", role: "assistant", finish: "stop", time: { created: 3, completed: 4 } } as never] },
++      part: { msg_2: [{ id: "prt_2", messageID: "msg_2", sessionID: "ses_1", type: "text", text } as Part] },
++    })
++    expect(applyDirectoryEvent(next, { type: "message.part.updated", properties: { sessionID: "ses_1", part: next.part.msg_2[0] } } as Event)).toBe(true)
++    expect(next.message.ses_1).toHaveLength(1)
++  })
++
+   test("returns typed materialization when delta arrives before parts", () => {
+     const result = applyDirectoryEvent(state(), deltaEvent())
+ 
+diff --git a/packages/ui/src/sync/__tests__/materialization.test.ts b/packages/ui/src/sync/__tests__/materialization.test.ts
+index 192516326..fc2b4f958 100644
+--- a/packages/ui/src/sync/__tests__/materialization.test.ts
++++ b/packages/ui/src/sync/__tests__/materialization.test.ts
+@@ -12,6 +12,10 @@ function message(id: string, sessionID = "ses_1"): Message {
+   return { id, sessionID, role: "assistant", time: { created: 1 } } as Message
+ }
+ 
++function completedMessage(id: string, parentID: string, sessionID = "ses_1"): Message {
++  return { id, sessionID, role: "assistant", parentID, time: { created: 1, completed: 2 } } as Message
++}
++
+ function userMessage(id: string, sessionID = "ses_1"): Message {
+   return { id, sessionID, role: "user", time: { created: 1 } } as Message
+ }
+@@ -57,6 +61,21 @@ describe("materializeSessionSnapshots", () => {
+     expect(result.partsChanged).toBe(true)
+   })
+ 
++  test("filters completed exact assistant duplicates with the same parent", () => {
++    const result = materializeSessionSnapshots(
++      { message: {}, part: {} },
++      "ses_1",
++      [
++        { info: completedMessage("msg_1", "user_1"), parts: [part("prt_1", "msg_1", "text", "same answer")] },
++        { info: completedMessage("msg_2", "user_1"), parts: [part("prt_2", "msg_2", "text", "same answer")] },
++        { info: completedMessage("msg_3", "user_2"), parts: [part("prt_3", "msg_3", "text", "same answer")] },
++      ],
++    )
++
++    expect(result.messages.map((item) => item.id)).toEqual(["msg_1", "msg_3"])
++    expect(result.part.msg_2).toBe(undefined)
++  })
++
+   test("preserves unchanged references", () => {
+     const existingMessage = message("msg_1")
+     const existingPart = part("prt_1", "msg_1")
+diff --git a/packages/ui/src/sync/event-reducer.ts b/packages/ui/src/sync/event-reducer.ts
+index 13057258d..1c454f9b3 100644
+--- a/packages/ui/src/sync/event-reducer.ts
++++ b/packages/ui/src/sync/event-reducer.ts
+@@ -20,6 +20,7 @@ import {
+   findMessageIndex,
+   insertMessageChronologically,
+ } from "./message-ordering"
++import { appendSanitizedDelta, blockResponseMessage, clearResponseIntegrity, isDuplicateCompletedResponse, isResponseMessageBlocked, sanitizeResponseText } from "./response-integrity"
+ 
+ const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
+ const DELTA_OVERLAP_FIELDS = ["text", "output"] as const
+@@ -188,6 +189,39 @@ function hasMessage(draft: State, sessionID: string | undefined, messageID: stri
+   return messages.some((message) => message.id === messageID)
+ }
+ 
++function getMessage(draft: State, sessionID: string | undefined, messageID: string): Message | undefined {
++  const candidateLists = sessionID
++    ? [draft.message[sessionID]]
++    : Object.values(draft.message)
++  for (const messages of candidateLists) {
++    if (!messages) continue
++    const result = Binary.search(messages, messageID, (message) => message.id)
++    if (result.found) return messages[result.index]
++  }
++  return undefined
++}
++
++function isMessageCompleted(message: Message | undefined): boolean {
++  if (!message) return false
++  return Boolean(
++    (message as { finish?: unknown }).finish
++    || (message.time as { completed?: unknown } | undefined)?.completed,
++  )
++}
++
++function removeMessage(draft: State, sessionID: string | undefined, messageID: string): boolean {
++  if (!sessionID) return false
++  const messages = draft.message[sessionID]
++  if (!messages) return false
++  const result = Binary.search(messages, messageID, (message) => message.id)
++  if (!result.found) return false
++  const next = [...messages]
++  next.splice(result.index, 1)
++  draft.message[sessionID] = next
++  delete draft.part[messageID]
++  return true
++}
++
+ export function reduceGlobalEvent(event: Event): GlobalEventResult {
+   if (event.type === "global.disposed" || event.type === "server.connected") {
+     return { type: "refresh" }
+@@ -301,6 +335,7 @@ export function applyDirectoryEvent(
+       const info = props.info ?? (result.found ? sessions[result.index] : undefined)
+       if (result.found) sessions.splice(result.index, 1)
+       cleanupSessionCaches(draft, sessionID, callbacks?.onSetSessionTodo)
++      clearResponseIntegrity(sessionID)
+       if (!info?.parentID) draft.sessionTotal = Math.max(0, draft.sessionTotal - 1)
+       markSessionEvent(sessionID, true)
+       return true
+@@ -353,6 +388,9 @@ export function applyDirectoryEvent(
+ 
+     case "message.updated": {
+       const info = (event.properties as { info: Message }).info
++      if (isResponseMessageBlocked(info.sessionID, info.id)) {
++        return false
++      }
+       const messages = draft.message[info.sessionID]
+       if (!messages) {
+         draft.message[info.sessionID] = [info]
+@@ -408,11 +446,38 @@ export function applyDirectoryEvent(
+       const messageID = (part as { messageID?: string }).messageID
+       const sessionID = props.sessionID ?? (part as { sessionID?: string }).sessionID
+       if (!messageID) return false
++      const owner = getMessage(draft, sessionID, messageID)
++      const existingParts = draft.part[messageID]
++
++      let nextPart = part
++      if (part.type === "text") {
++        const field = "text"
++        const rawValue = (part as Record<string, unknown>)[field]
++        if (typeof rawValue === "string") {
++          const sanitized = sanitizeResponseText(rawValue)
++          if (sanitized.polluted) {
++            if (sanitized.internalLeak && sanitized.text.length === 0) {
++              blockResponseMessage(sessionID, messageID)
++              return removeMessage(draft, sessionID, messageID)
++            }
++            nextPart = { ...part, [field]: sanitized.text } as Part
++          }
++        }
++      }
++
++      if (owner?.role === "assistant" && isMessageCompleted(owner)) {
++        const text = (nextPart as Record<string, unknown>).text
++        if (typeof text === "string" && isDuplicateCompletedResponse(sessionID, messageID, text)) {
++          return removeMessage(draft, sessionID, messageID)
++        }
++      }
++
++      const effectivePart = nextPart
+       const missingOwningMessage = !hasMessage(draft, sessionID, messageID)
+-      const parts = draft.part[messageID]
++      const parts = existingParts
+       if (!parts) {
+         syncDebug.reducer.partUpdatedNoExistingParts(messageID, part.id, part.type)
+-        draft.part[messageID] = [part]
++        draft.part[messageID] = [effectivePart]
+         return missingOwningMessage
+           ? {
+             changed: true,
+@@ -421,31 +486,31 @@ export function applyDirectoryEvent(
+           : true
+       }
+       const next = [...parts]
+-      const partIndex = next.findIndex((candidate) => candidate.id === part.id)
++      const partIndex = next.findIndex((candidate) => candidate.id === effectivePart.id)
+       if (partIndex >= 0) {
+         const previous = next[partIndex]
+-        if (shouldPreserveExistingPart(previous, part)) {
++        if (shouldPreserveExistingPart(previous, effectivePart)) {
+           return false
+         }
+-        const dedupeFields = getUpdatedDeltaFields(previous, part)
++        const dedupeFields = getUpdatedDeltaFields(previous, effectivePart)
+         next[partIndex] = dedupeFields.length > 0
+-          ? { ...part, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
+-          : part
++          ? { ...effectivePart, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
++          : effectivePart
+       } else {
+         // Replace optimistic part (no sessionID) with server part of same type.
+         // Gate: only scan if the first part lacks sessionID (optimistic parts are
+         // always inserted first). Assistant messages never have optimistic parts,
+         // so this check is effectively free during streaming.
+         const hasOptimistic = next.length > 0 && !(next[0] as { sessionID?: string }).sessionID
+-        const optimisticIndex = hasOptimistic && (part.type === "text" || part.type === "file")
+-          ? next.findIndex((p) => p.type === part.type && !(p as { sessionID?: string }).sessionID)
++        const optimisticIdx = hasOptimistic && (effectivePart.type === "text" || effectivePart.type === "file")
++          ? next.findIndex((p) => p.type === effectivePart.type && !(p as { sessionID?: string }).sessionID)
+           : -1
+-        if (optimisticIndex >= 0) {
++        if (optimisticIdx >= 0) {
+           // Replace in place: pushing to the end reorders text/file parts of a
+           // just-sent message and remounts its rendered subtree.
+-          next[optimisticIndex] = part
++          next[optimisticIdx] = effectivePart
+         } else {
+-          next.push(part)
++          next.push(effectivePart)
+         }
+       }
+       draft.part[messageID] = next
+@@ -501,13 +566,29 @@ export function applyDirectoryEvent(
+       }
+       const existing = parts[partIndex] as Record<string, unknown>
+       const existingValue = existing[props.field] as string | undefined
++      const owner = getMessage(draft, props.sessionID, props.messageID)
++      if (isMessageCompleted(owner)) {
++        return false
++      }
+       const dedupeFields = (existing as DedupeMetadata).__dedupeNextDeltaFields ?? []
+       const shouldDedupe = dedupeFields.includes(props.field)
++      const sanitized = props.field === "text" || props.field === "output"
++        ? appendSanitizedDelta(existingValue, props.delta)
++        : { text: (existingValue ?? "") + props.delta, polluted: false, internalLeak: false }
++      if (sanitized.polluted && sanitized.text === existingValue) {
++        if (sanitized.internalLeak && sanitized.text.length === 0) {
++          blockResponseMessage(props.sessionID, props.messageID)
++          return removeMessage(draft, props.sessionID, props.messageID)
++        }
++        return false
++      }
+       // Create new Part object + new array so React detects the change
+       const next = [...parts]
+       next[partIndex] = {
+         ...existing,
+-        [props.field]: shouldDedupe ? appendNonOverlappingDelta(existingValue, props.delta) : (existingValue ?? "") + props.delta,
++        [props.field]: shouldDedupe
++          ? appendNonOverlappingDelta(existingValue, props.delta)
++          : sanitized.text,
+         __dedupeNextDeltaFields: dedupeFields.filter((field) => field !== props.field),
+       } as unknown as Part
+       draft.part[props.messageID] = next
+diff --git a/packages/ui/src/sync/materialization.ts b/packages/ui/src/sync/materialization.ts
+index 89a653d25..adb4b8a29 100644
+--- a/packages/ui/src/sync/materialization.ts
++++ b/packages/ui/src/sync/materialization.ts
+@@ -98,6 +98,39 @@ function filterMaterializedParts(parts: Part[], skipPartTypes: ReadonlySet<strin
+     .filter((part) => !!part?.id && !skipPartTypes.has(part.type))
+ }
+ 
++function completedAssistantDuplicateKey(message: Message, parts: Part[]): string | undefined {
++  if (message.role !== "assistant" || !(message.time?.completed && message.time.completed > 0)) return undefined
++  const parentID = typeof message.parentID === "string" ? message.parentID : ""
++  if (!parentID) return undefined
++  const text = parts
++    .filter((part) => part.type === "text")
++    .map((part) => String((part as { text?: unknown }).text ?? "").replace(/\r\n/g, "\n").trim())
++    .filter(Boolean)
++    .join("\n")
++  if (!text) return undefined
++  return `${parentID}\u0000${text}`
++}
++
++function removeMaterializedAssistantDuplicates(
++  messages: Message[],
++  partState: Record<string, Part[]>,
++): { messages: Message[]; part: Record<string, Part[]>; changed: boolean } {
++  const seen = new Set<string>()
++  const duplicateIDs = new Set<string>()
++  for (const message of messages) {
++    const key = completedAssistantDuplicateKey(message, partState[message.id] ?? [])
++    if (!key) continue
++    if (seen.has(key)) duplicateIDs.add(message.id)
++    else seen.add(key)
++  }
++  if (duplicateIDs.size === 0) return { messages, part: partState, changed: false }
++
++  const nextMessages = messages.filter((message) => !duplicateIDs.has(message.id))
++  const nextPart = { ...partState }
++  for (const messageID of duplicateIDs) delete nextPart[messageID]
++  return { messages: nextMessages, part: nextPart, changed: true }
++}
++
+ function haveEquivalentPartSnapshots(left: Part[] | undefined, right: Part[]): boolean {
+   // `undefined` means "parts never fetched", which is NOT equivalent to a
+   // fetched-empty snapshot — the empty array must be committed so
+@@ -284,8 +317,8 @@ export function materializeSessionSnapshots(
+     if (reconciledCurrentMessages === currentMessages) reconciledCurrentMessages = [...currentMessages]
+     reconciledCurrentMessages[index] = incoming
+   }
+-  const messages = mergeMessages(reconciledCurrentMessages, nextMessages)
+-  const messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
++  let messages = mergeMessages(reconciledCurrentMessages, nextMessages)
++  let messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
+ 
+   let partsChanged = false
+   let nextPartState = state.part
+@@ -325,6 +358,14 @@ export function materializeSessionSnapshots(
+     partsChanged = true
+   }
+ 
++  const duplicateResult = removeMaterializedAssistantDuplicates(messages, nextPartState)
++  if (duplicateResult.changed) {
++    messages = duplicateResult.messages
++    nextPartState = duplicateResult.part
++    messagesChanged = true
++    partsChanged = true
++  }
++
+   return {
+     message: messagesChanged ? { ...state.message, [sessionID]: messages } : state.message,
+     part: partsChanged ? nextPartState : state.part,
+diff --git a/packages/ui/src/sync/response-integrity.ts b/packages/ui/src/sync/response-integrity.ts
+new file mode 100644
+index 000000000..24bea259d
+--- /dev/null
++++ b/packages/ui/src/sync/response-integrity.ts
+@@ -0,0 +1,139 @@
++// These signatures were observed only as unsolicited sentence-final tails.
++// Requiring punctuation before the tail avoids filtering legitimate discussion
++// of words such as "invalid" or selectors such as ">xpath" in normal prose.
++const POLLUTION_PATTERNS = [
++  {
++    pattern: /(?<=[。.!?])\s*(?:_久久爱(?:\s+六合彩[?？]?)?|六合彩[?？]?|porn(?:filmer)?(?:\.\.\.)?|geeky\?|\bBaebele\b|\bNow ending\.|>xpath\b|invalid\.?|Winvalid\.?)\s*$/iu,
++    internalLeak: false,
++  },
++  {
++    pattern: /(?:^|\n)\s*(?:I failed\.?|No final\??|No output\.?|Stop\.?|End\.?|\[END\])\s*(?:\n|$)/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\bThis is (?:clearly )?a system loop\b/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\bThis is analysis, not user visible\b/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\bI (?:need|must) (?:just )?stop producing tokens\b/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\bNo more channel calls\b/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\banalysis channel ongoing\b/iu,
++    internalLeak: true,
++  },
++  {
++    pattern: /\b(?:the )?harness keeps generation\b/iu,
++    internalLeak: true,
++  },
++]
++
++const STRONG_INTERNAL_LEAK_PATTERNS = [
++  /\bThis is (?:clearly )?a system loop\b/iu,
++  /\bThis is analysis, not user visible\b/iu,
++  /\bI (?:need|must) (?:just )?stop producing tokens\b/iu,
++  /\bNo more channel calls\b/iu,
++  /\banalysis channel ongoing\b/iu,
++  /\b(?:the )?harness keeps generation\b/iu,
++]
++
++const MAX_TRACKED_SESSIONS = 256
++
++type CompletedResponse = {
++  messageID: string
++  text: string
++}
++
++const completedResponses = new Map<string, CompletedResponse>()
++const blockedMessages = new Set<string>()
++
++function messageKey(sessionID: string | undefined, messageID: string): string | undefined {
++  return sessionID ? `${sessionID}:${messageID}` : undefined
++}
++
++export function sanitizeResponseText(value: string): { text: string; polluted: boolean; internalLeak: boolean } {
++  let firstMatch = -1
++  let internalLeak = false
++  for (const candidate of POLLUTION_PATTERNS) {
++    const match = candidate.pattern.exec(value)
++    if (match && (firstMatch < 0 || match.index < firstMatch)) {
++      firstMatch = match.index
++      internalLeak = candidate.internalLeak
++    }
++  }
++
++  if (firstMatch < 0) return { text: value, polluted: false, internalLeak: false }
++
++  return {
++    text: value.slice(0, firstMatch).trimEnd(),
++    polluted: true,
++    internalLeak: internalLeak && STRONG_INTERNAL_LEAK_PATTERNS.some((pattern) => pattern.test(value)),
++  }
++}
++
++export function appendSanitizedDelta(existing: string | undefined, delta: string): {
++  text: string
++  polluted: boolean
++  internalLeak: boolean
++} {
++  const current = existing ?? ""
++  const sanitized = sanitizeResponseText(current + delta)
++  if (!sanitized.polluted) {
++    return { text: current + delta, polluted: false, internalLeak: false }
++  }
++
++  if (sanitized.text.startsWith(current)) {
++    return { text: sanitized.text, polluted: true, internalLeak: sanitized.internalLeak }
++  }
++
++  if (current.startsWith(sanitized.text)) {
++    return { text: sanitized.text, polluted: true, internalLeak: sanitized.internalLeak }
++  }
++
++  return { text: current, polluted: true, internalLeak: sanitized.internalLeak }
++}
++
++export function isDuplicateCompletedResponse(sessionID: string | undefined, messageID: string, text: string): boolean {
++  if (!sessionID || text.trim().length < 20) return false
++
++  const previous = completedResponses.get(sessionID)
++  completedResponses.set(sessionID, { messageID, text })
++  if (completedResponses.size > MAX_TRACKED_SESSIONS) {
++    const oldest = completedResponses.keys().next().value
++    if (typeof oldest === "string") completedResponses.delete(oldest)
++  }
++
++  return previous !== undefined
++    && previous.messageID !== messageID
++    && previous.text === text
++}
++
++export function clearResponseIntegrity(sessionID: string): void {
++  completedResponses.delete(sessionID)
++  for (const key of blockedMessages) {
++    if (key.startsWith(`${sessionID}:`)) blockedMessages.delete(key)
++  }
++}
++
++export function blockResponseMessage(sessionID: string | undefined, messageID: string): void {
++  const key = messageKey(sessionID, messageID)
++  if (key) blockedMessages.add(key)
++}
++
++export function isResponseMessageBlocked(sessionID: string | undefined, messageID: string): boolean {
++  const key = messageKey(sessionID, messageID)
++  return key ? blockedMessages.has(key) : false
++}
++
++export function resetResponseIntegrityForTests(): void {
++  completedResponses.clear()
++  blockedMessages.clear()
++}
+diff --git a/packages/web/server/lib/opencode/proxy.js b/packages/web/server/lib/opencode/proxy.js
+index adcf9ae46..2ffebee20 100644
+--- a/packages/web/server/lib/opencode/proxy.js
++++ b/packages/web/server/lib/opencode/proxy.js
+@@ -408,6 +408,8 @@ export const registerOpenCodeProxy = (app, deps) => {
+ 
+   const PROXY_REQUEST_TIMEOUT_MS = normalizeProxyTimeout(LONG_REQUEST_TIMEOUT_MS);
+   const PROXY_TIMEOUT_MARKER = Symbol('openchamberProxyTimedOut');
++  const PROMPT_IDEMPOTENCY_TTL_MS = 15 * 60 * 1000;
++  const acceptedPromptIDs = new Map();
+ 
+   // A provider OAuth callback blocks upstream for as long as the user takes to
+   // sign in in their browser (device-code polling, or a loopback redirect), so
+@@ -932,6 +934,67 @@ export const registerOpenCodeProxy = (app, deps) => {
+   const apiProxy = createApiProxy(PROXY_REQUEST_TIMEOUT_MS);
+   const interactiveOAuthProxy = createApiProxy(INTERACTIVE_OAUTH_TIMEOUT_MS);
+ 
++  // A transport timeout is ambiguous: the upstream prompt may already be
++  // running even though the browser did not receive its response. Keep the
++  // client-generated message ID claimed for a bounded window so a retry cannot
++  // start a second turn. Requests without messageID are background/internal
++  // continuations and intentionally remain outside this gate.
++  const promptIdempotencyGate = (req, res, next) => {
++    const messageID = typeof req.body?.messageID === 'string' ? req.body.messageID.trim() : '';
++    const sessionID = typeof req.params?.sessionID === 'string' ? req.params.sessionID : '';
++    if (!messageID || !sessionID) return next();
++
++    const directory = typeof req.headers?.['x-opencode-directory'] === 'string'
++      ? req.headers['x-opencode-directory']
++      : '';
++    const key = `${sessionID}\u0000${directory}\u0000${messageID}`;
++    const now = Date.now();
++    const existing = acceptedPromptIDs.get(key);
++    if (existing && existing > now) {
++      return res.status(202).json({ messageID, deduplicated: true });
++    }
++
++    const claim = now + PROMPT_IDEMPOTENCY_TTL_MS;
++    acceptedPromptIDs.set(key, claim);
++    const remember = () => {
++      acceptedPromptIDs.set(key, claim);
++      const timer = setTimeout(() => {
++        if (acceptedPromptIDs.get(key) === claim) acceptedPromptIDs.delete(key);
++      }, PROMPT_IDEMPOTENCY_TTL_MS);
++      timer.unref?.();
++    };
++
++    // Recover the claim after a proxy restart. The upstream has already
++    // persisted the user message when a previous prompt request was accepted.
++    // A failed probe is deliberately fail-open: it must not turn a temporary
++    // upstream read outage into a lost user send.
++    const encodedSessionID = encodeURIComponent(sessionID);
++    const encodedMessageID = encodeURIComponent(messageID);
++    const messageURL = buildOpenCodeUrl(`/session/${encodedSessionID}/message/${encodedMessageID}`, '')
++      + (directory ? `?directory=${encodeURIComponent(directory)}` : '');
++    fetch(messageURL, {
++      method: 'GET',
++      headers: {
++        Accept: 'application/json',
++        ...getOpenCodeAuthHeaders(),
++        ...(directory ? { 'x-opencode-directory': directory } : {}),
++      },
++      signal: AbortSignal.timeout(1500),
++    }).then((probe) => {
++      if (probe.ok && !res.headersSent && !res.writableEnded) {
++        remember();
++        res.status(202).json({ messageID, deduplicated: true });
++        return;
++      }
++      remember();
++      next();
++    }).catch(() => {
++      remember();
++      next();
++    });
++    return undefined;
++  };
++
+   // Best-effort fallback for stale clients still sending symlink paths.
+   // Settings and project selection normalize at source; this cached async path
+   // avoids blocking the proxy hot path on every directory-scoped request.
+@@ -948,6 +1011,7 @@ export const registerOpenCodeProxy = (app, deps) => {
+   });
+ 
+   app.use('/api', applyProxyResponseDeadline);
++  app.post('/api/session/:sessionID/prompt_async', promptIdempotencyGate);
+   app.post('/api/provider/:providerID/oauth/callback', interactiveOAuthProxy);
+   // OpenCode's native MCP OAuth flow: the request blocks until the user
+   // finishes authorization in the browser (up to OpenCode's 5-minute callback
+diff --git a/packages/web/server/lib/opencode/proxy.test.js b/packages/web/server/lib/opencode/proxy.test.js
+index 77346d479..4f2db3f69 100644
+--- a/packages/web/server/lib/opencode/proxy.test.js
++++ b/packages/web/server/lib/opencode/proxy.test.js
+@@ -1,6 +1,8 @@
+ import http from 'node:http';
+ import https from 'node:https';
++import path from 'node:path';
+ 
++import express from 'express';
+ import { createProxyMiddleware } from 'http-proxy-middleware';
+ import { describe, expect, it } from 'vitest';
+ 
+@@ -8,6 +10,7 @@ import {
+   createDirectoryQueryCanonicalizer,
+   createOpenCodeProxyAgent,
+   normalizeForwardedDirectoryHeaders,
++  registerOpenCodeProxy,
+ } from './proxy.js';
+ 
+ describe('createDirectoryQueryCanonicalizer', () => {
+@@ -250,3 +253,111 @@ describe('createOpenCodeProxyAgent', () => {
+     }
+   });
+ });
++
++describe('prompt idempotency', () => {
++  const listenServer = (app) => new Promise((resolve, reject) => {
++    const server = app.listen(0, '127.0.0.1', () => resolve(server));
++    server.once('error', reject);
++  });
++
++  it('does not forward a duplicate prompt_async request with the same messageID', async () => {
++    let upstreamCalls = 0;
++    const upstream = express();
++    upstream.post('/session/abc/prompt_async', express.json(), async (_req, res) => {
++      upstreamCalls += 1;
++      await new Promise((resolve) => setTimeout(resolve, 80));
++      res.json({ accepted: true });
++    });
++    const upstreamServer = await listenServer(upstream);
++    const upstreamPort = upstreamServer.address().port;
++
++    const app = express();
++    app.use('/api', express.json());
++    registerOpenCodeProxy(app, {
++      fs: {},
++      os: {},
++      path,
++      OPEN_CODE_READY_GRACE_MS: 0,
++      getRuntime: () => ({
++        openCodePort: upstreamPort,
++        openCodeBaseUrl: `http://127.0.0.1:${upstreamPort}`,
++        isOpenCodeReady: true,
++        openCodeNotReadySince: 0,
++        isRestartingOpenCode: false,
++      }),
++      getOpenCodeAuthHeaders: () => ({}),
++      buildOpenCodeUrl: (requestPath) => `http://127.0.0.1:${upstreamPort}${requestPath}`,
++      ensureOpenCodeApiPrefix: () => {},
++    });
++    const proxyServer = await listenServer(app);
++    const proxyPort = proxyServer.address().port;
++    const sendPrompt = () => fetch(`http://127.0.0.1:${proxyPort}/api/session/abc/prompt_async`, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ messageID: 'msg_same', parts: [{ type: 'text', text: 'hello' }] }),
++    });
++
++    try {
++      const first = sendPrompt();
++      await new Promise((resolve) => setTimeout(resolve, 10));
++      const second = await sendPrompt();
++      const firstResponse = await first;
++
++      expect(firstResponse.status).toBe(200);
++      expect(second.status).toBe(202);
++      expect(await second.json()).toMatchObject({ messageID: 'msg_same', deduplicated: true });
++      expect(upstreamCalls).toBe(1);
++    } finally {
++      await closeServer(proxyServer);
++      await closeServer(upstreamServer);
++    }
++  });
++
++  it('recovers the idempotency claim from an already persisted upstream message', async () => {
++    let upstreamPosts = 0;
++    const upstream = express();
++    upstream.get('/session/abc/message/msg_existing', (_req, res) => res.json({ info: { id: 'msg_existing' } }));
++    upstream.post('/session/abc/prompt_async', express.json(), (_req, res) => {
++      upstreamPosts += 1;
++      res.json({ accepted: true });
++    });
++    const upstreamServer = await listenServer(upstream);
++    const upstreamPort = upstreamServer.address().port;
++
++    const app = express();
++    app.use('/api', express.json());
++    registerOpenCodeProxy(app, {
++      fs: {},
++      os: {},
++      path,
++      OPEN_CODE_READY_GRACE_MS: 0,
++      getRuntime: () => ({
++        openCodePort: upstreamPort,
++        openCodeBaseUrl: `http://127.0.0.1:${upstreamPort}`,
++        isOpenCodeReady: true,
++        openCodeNotReadySince: 0,
++        isRestartingOpenCode: false,
++      }),
++      getOpenCodeAuthHeaders: () => ({}),
++      buildOpenCodeUrl: (requestPath) => `http://127.0.0.1:${upstreamPort}${requestPath}`,
++      ensureOpenCodeApiPrefix: () => {},
++    });
++    const proxyServer = await listenServer(app);
++    const proxyPort = proxyServer.address().port;
++
++    try {
++      const response = await fetch(`http://127.0.0.1:${proxyPort}/api/session/abc/prompt_async`, {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ messageID: 'msg_existing', parts: [{ type: 'text', text: 'hello' }] }),
++      });
++
++      expect(response.status).toBe(202);
++      expect(await response.json()).toMatchObject({ messageID: 'msg_existing', deduplicated: true });
++      expect(upstreamPosts).toBe(0);
++    } finally {
++      await closeServer(proxyServer);
++      await closeServer(upstreamServer);
++    }
++  });
++});
+diff --git a/scripts/cleanup-polluted-assistant-messages.py b/scripts/cleanup-polluted-assistant-messages.py
+new file mode 100644
+index 000000000..3598cbe8b
+--- /dev/null
++++ b/scripts/cleanup-polluted-assistant-messages.py
+@@ -0,0 +1,218 @@
++#!/usr/bin/env python3
++"""OpenChamber migration: back up and remove historical polluted assistant text."""
++
++from __future__ import annotations
++
++import argparse
++import datetime as dt
++import json
++import re
++import shutil
++import sqlite3
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Iterable
++
++
++DEFAULT_DB = Path(r"D:\AI\Memory\opencode\opencode.db")
++
++POLLUTION_PATTERNS = (
++    (re.compile(r"(?<=[。.!?])\s*(?:_久久爱(?:\s+六合彩[?？]?)?|六合彩[?？]?|porn(?:filmer)?(?:\.\.\.)?|geeky\?|\bBaebele\b|\bNow ending\.|>xpath\b|invalid\.?|Winvalid\.?)\s*$", re.I), False),
++    (re.compile(r"(?:^|\n)\s*(?:I failed\.?|No final\??|No output\.?|Stop\.?|End\.?|\[END\])\s*(?:\n|$)", re.I), True),
++    (re.compile(r"\bThis is (?:clearly )?a system loop\b", re.I), True),
++    (re.compile(r"\bThis is analysis, not user visible\b", re.I), True),
++    (re.compile(r"\bI (?:need|must) (?:just )?stop producing tokens\b", re.I), True),
++    (re.compile(r"\bNo more channel calls\b", re.I), True),
++    (re.compile(r"\banalysis channel ongoing\b", re.I), True),
++    (re.compile(r"\b(?:the )?harness keeps generation\b", re.I), True),
++)
++
++
++@dataclass
++class PartChange:
++    session_id: str
++    part_id: str
++    message_id: str
++    old_text: str
++    new_text: str
++    internal_leak: bool
++
++
++@dataclass
++class MigrationReport:
++    scanned_assistant_messages: int = 0
++    matched_messages: int = 0
++    deleted_messages: int = 0
++    sanitized_parts: int = 0
++    skipped_malformed_parts: int = 0
++    backup_path: str | None = None
++    matched_by_session: dict[str, int] = field(default_factory=dict)
++
++
++def sanitize_text(value: str) -> tuple[str, bool, bool]:
++    first_match: int | None = None
++    internal_leak = False
++    for pattern, is_internal in POLLUTION_PATTERNS:
++        match = pattern.search(value)
++        if match and (first_match is None or match.start() < first_match):
++            first_match = match.start()
++            internal_leak = is_internal
++    if first_match is None:
++        return value, False, False
++    return value[:first_match].rstrip(), True, internal_leak
++
++
++def iter_text_parts(conn: sqlite3.Connection, session_id: str | None = None) -> Iterable[tuple[str, str, str, str]]:
++    query = """
++        SELECT m.id, m.session_id, p.id, p.data
++        FROM message AS m
++        JOIN part AS p ON p.message_id = m.id
++        WHERE json_extract(m.data, '$.role') = 'assistant'
++          AND json_extract(p.data, '$.type') = 'text'
++    """
++    params: tuple[str, ...] = ()
++    if session_id:
++        query += " AND m.session_id = ?"
++        params = (session_id,)
++    query += " ORDER BY m.time_created, p.time_created"
++    # Materialize the read-only result so the cursor is finalized before the
++    # caller closes the connection (important on Windows).
++    return conn.execute(query, params).fetchall()
++
++
++def collect_changes(conn: sqlite3.Connection, session_id: str | None = None) -> tuple[MigrationReport, list[PartChange], set[str]]:
++    report = MigrationReport()
++    changes: list[PartChange] = []
++    delete_messages: set[str] = set()
++    message_texts: dict[str, list[tuple[str, str, bool]]] = {}
++
++    for message_id, sid, part_id, raw_data in iter_text_parts(conn, session_id):
++        report.scanned_assistant_messages += 1
++        try:
++            data = json.loads(raw_data)
++            text = data.get("text")
++        except (TypeError, json.JSONDecodeError):
++            report.skipped_malformed_parts += 1
++            continue
++        if not isinstance(text, str):
++            continue
++        new_text, polluted, internal_leak = sanitize_text(text)
++        message_texts.setdefault(message_id, []).append((part_id, new_text, polluted and internal_leak))
++        if polluted and new_text != text:
++            changes.append(PartChange(sid, part_id, message_id, text, new_text, internal_leak))
++
++    for message_id, parts in message_texts.items():
++        if any(internal for _, _, internal in parts) and all(not text for _, text, _ in parts):
++            delete_messages.add(message_id)
++
++    report.matched_messages = len({change.message_id for change in changes} | delete_messages)
++    report.deleted_messages = len(delete_messages)
++    report.sanitized_parts = sum(change.message_id not in delete_messages for change in changes)
++    for change in changes:
++        report.matched_by_session[change.session_id] = report.matched_by_session.get(change.session_id, 0) + 1
++    return report, changes, delete_messages
++
++
++def create_backup(db_path: Path, backup_path: Path | None = None) -> Path:
++    if backup_path is None:
++        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
++        backup_path = db_path.with_name(f"{db_path.name}.pollution-backup-{stamp}.sqlite")
++    if backup_path.exists():
++        raise FileExistsError(f"Backup already exists: {backup_path}")
++    backup_path.parent.mkdir(parents=True, exist_ok=True)
++    shutil.copy2(db_path, backup_path)
++    return backup_path
++
++
++def apply_changes(
++    db_path: Path,
++    changes: list[PartChange],
++    delete_messages: set[str],
++    fail_after: int | None = None,
++) -> None:
++    conn = sqlite3.connect(db_path)
++    conn.execute("PRAGMA foreign_keys = ON")
++    mutation_count = 0
++    try:
++        conn.execute("BEGIN IMMEDIATE")
++        for message_id in delete_messages:
++            conn.execute("DELETE FROM part WHERE message_id = ?", (message_id,))
++            conn.execute("DELETE FROM message WHERE id = ?", (message_id,))
++            mutation_count += 1
++            if fail_after is not None and mutation_count >= fail_after:
++                raise RuntimeError("injected migration failure")
++
++        for change in changes:
++            if change.message_id in delete_messages:
++                continue
++            row = conn.execute("SELECT data FROM part WHERE id = ?", (change.part_id,)).fetchone()
++            if row is None:
++                raise RuntimeError(f"Part disappeared during migration: {change.part_id}")
++            data = json.loads(row[0])
++            data["text"] = change.new_text
++            conn.execute("UPDATE part SET data = ?, time_updated = ? WHERE id = ?", (
++                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
++                int(dt.datetime.now().timestamp() * 1000),
++                change.part_id,
++            ))
++            mutation_count += 1
++            if fail_after is not None and mutation_count >= fail_after:
++                raise RuntimeError("injected migration failure")
++
++        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
++        if integrity != "ok":
++            raise RuntimeError(f"SQLite integrity check failed: {integrity}")
++        conn.commit()
++    except Exception:
++        conn.rollback()
++        raise
++    finally:
++        conn.close()
++
++
++def verify_clean(db_path: Path, session_id: str | None = None) -> int:
++    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
++    try:
++        _, changes, delete_messages = collect_changes(conn, session_id)
++        remaining = {change.message_id for change in changes} - delete_messages
++        if remaining:
++            raise RuntimeError(f"Polluted assistant messages remain: {sorted(remaining)}")
++        return len(delete_messages)
++    finally:
++        conn.close()
++
++
++def migrate(db_path: Path, apply: bool, session_id: str | None = None, backup_path: Path | None = None, fail_after: int | None = None) -> MigrationReport:
++    if not db_path.exists():
++        raise FileNotFoundError(db_path)
++    mode = "ro" if not apply else "rw"
++    conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True)
++    try:
++        report, changes, delete_messages = collect_changes(conn, session_id)
++    finally:
++        conn.close()
++
++    if not apply:
++        return report
++
++    report.backup_path = str(create_backup(db_path, backup_path))
++    apply_changes(db_path, changes, delete_messages, fail_after)
++    verify_clean(db_path, session_id)
++    return report
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
++    parser.add_argument("--session-id")
++    parser.add_argument("--apply", action="store_true", help="Apply changes; default is a read-only dry-run")
++    parser.add_argument("--backup-path", type=Path)
++    args = parser.parse_args()
++
++    report = migrate(args.db, args.apply, args.session_id, args.backup_path)
++    print(json.dumps({"mode": "apply" if args.apply else "dry-run", **report.__dict__}, ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/scan-duplicate-assistant-messages.py b/scripts/scan-duplicate-assistant-messages.py
+new file mode 100644
+index 000000000..e56b1f44c
+--- /dev/null
++++ b/scripts/scan-duplicate-assistant-messages.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Scan all sessions for likely duplicate assistant messages without modifying the DB."""
++
++from __future__ import annotations
++
++import argparse
++import difflib
++import hashlib
++import json
++import sqlite3
++from collections import defaultdict
++from dataclasses import dataclass
++from pathlib import Path
++
++
++DEFAULT_DB = Path(r"D:\AI\Memory\opencode\opencode.db")
++
++
++@dataclass(frozen=True)
++class AssistantMessage:
++    message_id: str
++    session_id: str
++    parent_id: str
++    time_created: int
++    text: str
++
++
++def canonical_text(parts: list[tuple[int, str]]) -> str:
++    return "\n".join(text.replace("\r\n", "\n").rstrip() for _, text in sorted(parts))
++
++
++def load_messages(db_path: Path, session_id: str | None = None) -> list[AssistantMessage]:
++    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
++    try:
++        query = """
++            SELECT m.id, m.session_id, m.time_created, m.data, p.time_created, p.data
++            FROM message AS m
++            JOIN part AS p ON p.message_id = m.id
++            WHERE json_extract(m.data, '$.role') = 'assistant'
++              AND json_extract(p.data, '$.type') = 'text'
++        """
++        params: tuple[str, ...] = ()
++        if session_id:
++            query += " AND m.session_id = ?"
++            params = (session_id,)
++        query += " ORDER BY m.session_id, m.time_created, p.time_created, p.id"
++        grouped: dict[str, tuple[str, str, str, int, list[tuple[int, str]]]] = {}
++        for message_id, sid, message_time, raw_message, part_time, raw_part in conn.execute(query, params):
++            try:
++                message = json.loads(raw_message)
++                part = json.loads(raw_part)
++                text = part.get("text")
++            except (TypeError, json.JSONDecodeError):
++                continue
++            if not isinstance(text, str):
++                continue
++            if message_id not in grouped:
++                parent_id = message.get("parentID") if isinstance(message, dict) else ""
++                grouped[message_id] = (message_id, sid, parent_id if isinstance(parent_id, str) else "", message_time, [])
++            grouped[message_id][4].append((part_time, text))
++        return [AssistantMessage(mid, sid, parent, created, canonical_text(parts)) for mid, sid, parent, created, parts in grouped.values()]
++    finally:
++        conn.close()
++
++
++def scan(messages: list[AssistantMessage], window_seconds: int, similarity_threshold: float) -> dict:
++    exact_groups: list[dict] = []
++    similar_pairs: list[dict] = []
++    by_session_hash: dict[tuple[str, str, str], list[AssistantMessage]] = defaultdict(list)
++    for message in messages:
++        if not message.text or not message.parent_id:
++            continue
++        digest = hashlib.sha256(message.text.encode("utf-8")).hexdigest()
++        by_session_hash[(message.session_id, message.parent_id, digest)].append(message)
++
++    for (session_id, parent_id, _), group in by_session_hash.items():
++        group.sort(key=lambda item: item.time_created)
++        current: list[AssistantMessage] = [group[0]]
++        for message in group[1:]:
++            if (message.time_created - current[-1].time_created) / 1000 <= window_seconds:
++                current.append(message)
++            else:
++                if len(current) > 1:
++                    exact_groups.append(group_record(session_id, parent_id, current))
++                current = [message]
++        if len(current) > 1:
++            exact_groups.append(group_record(session_id, parent_id, current))
++
++    by_session: dict[str, list[AssistantMessage]] = defaultdict(list)
++    for message in messages:
++        if message.text:
++            by_session[message.session_id].append(message)
++    for session_id, group in by_session.items():
++        group.sort(key=lambda item: item.time_created)
++        for left, right in zip(group, group[1:]):
++            delta = (right.time_created - left.time_created) / 1000
++            if delta > window_seconds or left.text == right.text or not left.parent_id or left.parent_id != right.parent_id:
++                continue
++            ratio = difflib.SequenceMatcher(None, left.text, right.text).ratio()
++            if ratio >= similarity_threshold:
++                similar_pairs.append({
++                    "session_id": session_id,
++                    "parent_id": left.parent_id,
++                    "left_message_id": left.message_id,
++                    "right_message_id": right.message_id,
++                    "seconds_apart": round(delta, 3),
++                    "similarity": round(ratio, 4),
++                })
++
++    return {
++        "scanned_assistant_messages": len(messages),
++        "high_confidence_groups": exact_groups,
++        "high_confidence_candidate_messages": sum(len(group["message_ids"]) - 1 for group in exact_groups),
++        "similar_pairs_review_only": similar_pairs,
++    }
++
++
++def group_record(session_id: str, parent_id: str, messages: list[AssistantMessage]) -> dict:
++    return {
++        "session_id": session_id,
++        "parent_id": parent_id,
++        "keep_message_id": messages[0].message_id,
++        "message_ids": [message.message_id for message in messages],
++        "time_created": [message.time_created for message in messages],
++        "text_sha256": hashlib.sha256(messages[0].text.encode("utf-8")).hexdigest(),
++        "text_preview": messages[0].text[:240],
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
++    parser.add_argument("--session-id")
++    parser.add_argument("--window-seconds", type=int, default=600)
++    parser.add_argument("--similarity-threshold", type=float, default=0.92)
++    args = parser.parse_args()
++    messages = load_messages(args.db, args.session_id)
++    print(json.dumps(scan(messages, args.window_seconds, args.similarity_threshold), ensure_ascii=False, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/test-cleanup-polluted-assistant-messages.py b/scripts/test-cleanup-polluted-assistant-messages.py
+new file mode 100644
+index 000000000..aa400135b
+--- /dev/null
++++ b/scripts/test-cleanup-polluted-assistant-messages.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""Regression tests for the historical polluted-message migration."""
++
++from __future__ import annotations
++
++import importlib.util
++import gc
++import json
++import sqlite3
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++
++SCRIPT = Path(__file__).with_name("cleanup-polluted-assistant-messages.py")
++SPEC = importlib.util.spec_from_file_location("cleanup_polluted", SCRIPT)
++assert SPEC and SPEC.loader
++MODULE = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++
++SCHEMA = """
++CREATE TABLE session (id TEXT PRIMARY KEY);
++CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
++CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL,
++  FOREIGN KEY(message_id) REFERENCES message(id) ON DELETE CASCADE);
++"""
++
++
++def make_db(path: Path) -> None:
++    conn = sqlite3.connect(path)
++    conn.executescript(SCHEMA)
++    conn.execute("INSERT INTO session VALUES ('ses_1')")
++    rows = [
++        ("msg_user", "ses_1", "user", "Keep this user message."),
++        ("msg_clean", "ses_1", "assistant", "The build failed. No final artifact was generated."),
++        ("msg_mixed", "ses_1", "assistant", "正常结论。\nThis is clearly a system loop.\nNo final."),
++        ("msg_pure", "ses_1", "assistant", "I failed.\nThis is clearly a system loop.\nNo final."),
++    ]
++    for index, (message_id, session_id, role, text) in enumerate(rows):
++        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?)", (message_id, session_id, index, json.dumps({"id": message_id, "sessionID": session_id, "role": role})))
++        conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, ?)", (f"part_{message_id}", message_id, index, index, json.dumps({"id": f"part_{message_id}", "type": "text", "text": text})))
++    conn.commit()
++    conn.close()
++
++
++class CleanupMigrationTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.temp = tempfile.TemporaryDirectory()
++        self.db = Path(self.temp.name) / "opencode.db"
++        make_db(self.db)
++
++    def tearDown(self) -> None:
++        gc.collect()
++        self.temp.cleanup()
++
++    def test_dry_run_does_not_create_backup_or_modify_database(self) -> None:
++        with sqlite3.connect(self.db) as conn:
++            before = conn.execute("SELECT id, data FROM part ORDER BY id").fetchall()
++        report = MODULE.migrate(self.db, apply=False)
++        with sqlite3.connect(self.db) as conn:
++            after = conn.execute("SELECT id, data FROM part ORDER BY id").fetchall()
++        self.assertEqual(report.matched_messages, 2)
++        self.assertEqual(before, after)
++        self.assertEqual(list(Path(self.temp.name).glob("*.backup.sqlite")), [])
++
++    def test_apply_creates_backup_and_preserves_user_and_clean_messages(self) -> None:
++        report = MODULE.migrate(self.db, apply=True)
++        self.assertIsNotNone(report.backup_path)
++        self.assertTrue(Path(report.backup_path).exists())
++        conn = sqlite3.connect(self.db)
++        message_ids = {row[0] for row in conn.execute("SELECT id FROM message")}
++        self.assertEqual(message_ids, {"msg_user", "msg_clean", "msg_mixed"})
++        mixed = conn.execute("SELECT data FROM part WHERE message_id = 'msg_mixed'").fetchone()[0]
++        self.assertEqual(json.loads(mixed)["text"], "正常结论。")
++        self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
++        conn.close()
++
++    def test_failure_rolls_back_all_mutations(self) -> None:
++        with sqlite3.connect(self.db) as conn:
++            before = conn.execute("SELECT id, data FROM message ORDER BY id").fetchall()
++        conn = sqlite3.connect(self.db)
++        _, changes, deleted = MODULE.collect_changes(conn)
++        conn.close()
++        with self.assertRaises(RuntimeError):
++            MODULE.apply_changes(self.db, changes, deleted, fail_after=1)
++        with sqlite3.connect(self.db) as conn:
++            after = conn.execute("SELECT id, data FROM message ORDER BY id").fetchall()
++        self.assertEqual(before, after)
++        with sqlite3.connect(self.db) as conn:
++            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
++
++    def test_default_scan_covers_all_sessions(self) -> None:
++        conn = sqlite3.connect(self.db)
++        conn.execute("INSERT INTO session VALUES ('ses_2')")
++        message_id = "msg_other_session"
++        conn.execute("INSERT INTO message VALUES (?, ?, ?, ?)", (message_id, "ses_2", 10, json.dumps({"id": message_id, "sessionID": "ses_2", "role": "assistant"})))
++        conn.execute("INSERT INTO part VALUES (?, ?, ?, ?, ?)", ("part_other", message_id, 10, 10, json.dumps({"id": "part_other", "type": "text", "text": "I failed.\nThis is clearly a system loop."})))
++        conn.commit()
++        conn.close()
++
++        report = MODULE.migrate(self.db, apply=False)
++        self.assertIn("ses_1", report.matched_by_session)
++        self.assertIn("ses_2", report.matched_by_session)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/scripts/test-scan-duplicate-assistant-messages.py b/scripts/test-scan-duplicate-assistant-messages.py
+new file mode 100644
+index 000000000..88ae24fcf
+--- /dev/null
++++ b/scripts/test-scan-duplicate-assistant-messages.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Tests for the read-only duplicate assistant message scanner."""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++import unittest
++from pathlib import Path
++
++
++SCRIPT = Path(__file__).with_name("scan-duplicate-assistant-messages.py")
++SPEC = importlib.util.spec_from_file_location("scan_duplicates", SCRIPT)
++assert SPEC and SPEC.loader
++MODULE = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++
++class DuplicateScanTests(unittest.TestCase):
++    def message(self, message_id: str, session_id: str, seconds: int, text: str) -> object:
++        return MODULE.AssistantMessage(message_id, session_id, "parent-1", seconds * 1000, text)
++
++    def test_exact_consecutive_duplicate_keeps_first(self) -> None:
++        result = MODULE.scan([
++            self.message("m1", "s1", 0, "same answer"),
++            self.message("m2", "s1", 30, "same answer"),
++            self.message("m3", "s1", 60, "different answer"),
++        ], 600, 0.92)
++        self.assertEqual(result["high_confidence_candidate_messages"], 1)
++        self.assertEqual(result["high_confidence_groups"][0]["keep_message_id"], "m1")
++        self.assertEqual(result["high_confidence_groups"][0]["message_ids"], ["m1", "m2"])
++
++    def test_late_duplicate_is_not_a_candidate(self) -> None:
++        result = MODULE.scan([
++            self.message("m1", "s1", 0, "same answer"),
++            self.message("m2", "s1", 601, "same answer"),
++        ], 600, 0.92)
++        self.assertEqual(result["high_confidence_candidate_messages"], 0)
++
++    def test_different_parent_is_not_a_candidate(self) -> None:
++        result = MODULE.scan([
++            self.message("m1", "s1", 0, "same answer"),
++            MODULE.AssistantMessage("m2", "s1", "parent-2", 30 * 1000, "same answer"),
++        ], 600, 0.92)
++        self.assertEqual(result["high_confidence_candidate_messages"], 0)
++
++    def test_similar_content_is_review_only(self) -> None:
++        result = MODULE.scan([
++            self.message("m1", "s1", 0, "The deployment failed because the service is temporarily unavailable."),
++            self.message("m2", "s1", 30, "The deployment failed because the service is temporarily unavailable right now."),
++        ], 600, 0.92)
++        self.assertEqual(result["high_confidence_candidate_messages"], 0)
++        self.assertEqual(len(result["similar_pairs_review_only"]), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

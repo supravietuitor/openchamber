@@ -1,0 +1,176 @@
+name: Sync upstream patches
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream OpenChamber tag, for example v1.22.0. Empty means latest v* tag.'
+        required: false
+        type: string
+      skip_tests:
+        description: 'Skip focused validation (use only for diagnosing patch conflicts).'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-patches
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPOSITORY: https://github.com/openchamber/openchamber.git
+      SYNC_BRANCH: auto-upstream-sync
+      BASE_BRANCH: main
+    steps:
+      - name: Check out fork base
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Save patch set
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f fork-patches/0001-config-dir-env.patch
+          test -f fork-patches/0002-markdown-table-bom.patch
+          test -f fork-patches/0003-response-integrity-dedup-idempotency.patch
+          mkdir -p "$RUNNER_TEMP/openchamber-patches"
+          cp -R fork-patches/. "$RUNNER_TEMP/openchamber-patches/"
+          test -f RELEASE-NOTES-v1.21.1-patches.md && cp RELEASE-NOTES-v1.21.1-patches.md "$RUNNER_TEMP/"
+
+      - name: Resolve upstream tag
+        id: upstream
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+            [[ "$tag" == v* ]] || tag="v$tag"
+          else
+            tag=$(git ls-remote --tags --refs "$UPSTREAM_REPOSITORY" 'refs/tags/v*' \
+              | awk -F/ '{print $3}' | sort -V | tail -n 1)
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid upstream tag: $tag" >&2
+            exit 1
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved upstream tag: $tag"
+
+      - name: Prepare upstream source
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Keep the v1.21.1 patch base available when this bootstrap workflow
+          # first runs from the old fork main branch. Later releases can use
+          # the previous synchronization branch in the same way.
+          git fetch --no-tags origin adapt-v1.21.1 || true
+          git fetch --no-tags "$UPSTREAM_REPOSITORY" "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+          git switch --detach "$UPSTREAM_TAG"
+          cp -R "$RUNNER_TEMP/openchamber-patches" fork-patches
+          if [[ -f "$RUNNER_TEMP/RELEASE-NOTES-v1.21.1-patches.md" ]]; then
+            cp "$RUNNER_TEMP/RELEASE-NOTES-v1.21.1-patches.md" RELEASE-NOTES-v1.21.1-patches.md
+          fi
+
+      - name: Apply patch set in order
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in \
+            fork-patches/0001-config-dir-env.patch \
+            fork-patches/0002-markdown-table-bom.patch \
+            fork-patches/0003-response-integrity-dedup-idempotency.patch; do
+            echo "Applying $patch"
+            git apply --check --index "$patch"
+            git apply --3way --index "$patch"
+          done
+          git diff --check
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install dependencies
+        if: ${{ inputs.skip_tests != true }}
+        run: bun install --frozen-lockfile
+
+      - name: Run focused validation
+        if: ${{ inputs.skip_tests != true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun test packages/ui/src/sync/__tests__/event-reducer.test.ts packages/ui/src/sync/__tests__/materialization.test.ts
+          bun run --cwd packages/ui type-check
+          bun run --cwd packages/web test -- server/lib/opencode/proxy.test.js
+          node --check packages/web/server/lib/opencode/shared.js
+          python scripts/test-cleanup-polluted-assistant-messages.py
+          python scripts/test-scan-duplicate-assistant-messages.py
+
+      - name: Commit synchronized source
+        id: commit
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$SYNC_BRANCH"
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo "No synchronized changes for $UPSTREAM_TAG"
+            exit 0
+          fi
+          git commit -m "chore: sync upstream $UPSTREAM_TAG with local patches"
+          git push --force-with-lease origin "$SYNC_BRANCH"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Open or update synchronization PR
+        if: ${{ steps.commit.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body_file="$RUNNER_TEMP/sync-pr-body.md"
+          cat > "$body_file" <<EOF
+          ## Upstream synchronization
+
+          This PR is generated from upstream OpenChamber \
+          [${UPSTREAM_TAG}](https://github.com/openchamber/openchamber/releases/tag/${UPSTREAM_TAG}).
+
+          The local patch set was applied in order:
+
+          1. \
+          [0001-config-dir-env.patch](https://github.com/${GITHUB_REPOSITORY}/blob/${SYNC_BRANCH}/fork-patches/0001-config-dir-env.patch)
+          2. \
+          [0002-markdown-table-bom.patch](https://github.com/${GITHUB_REPOSITORY}/blob/${SYNC_BRANCH}/fork-patches/0002-markdown-table-bom.patch)
+          3. \
+          [0003-response-integrity-dedup-idempotency.patch](https://github.com/${GITHUB_REPOSITORY}/blob/${SYNC_BRANCH}/fork-patches/0003-response-integrity-dedup-idempotency.patch)
+
+          Focused tests and type checks run in the workflow. Review the diff for upstream changes around the patch targets before merging.
+          EOF
+
+          pr_number=$(gh pr list --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --title "chore: sync upstream ${UPSTREAM_TAG} with local patches" --body-file "$body_file"
+          else
+            gh pr create --base "$BASE_BRANCH" --head "$SYNC_BRANCH" \
+              --title "chore: sync upstream ${UPSTREAM_TAG} with local patches" \
+              --body-file "$body_file"
+          fi
