@@ -15,6 +15,12 @@ import { dropSessionCaches } from "./session-cache"
 import { stripSessionDiffSnapshots } from "./sanitize"
 import { syncDebug } from "./debug"
 import { shouldSkipStaleSessionEvent } from "./session-event-freshness"
+import {
+  compareMessagesChronologically,
+  findMessageIndex,
+  insertMessageChronologically,
+} from "./message-ordering"
+import { appendSanitizedDelta, blockResponseMessage, clearResponseIntegrity, isDuplicateCompletedResponse, isResponseMessageBlocked, sanitizeResponseText } from "./response-integrity"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const DELTA_OVERLAP_FIELDS = ["text", "output"] as const
@@ -180,7 +186,40 @@ function hasMessage(draft: State, sessionID: string | undefined, messageID: stri
   if (!sessionID) return false
   const messages = draft.message[sessionID]
   if (!messages) return false
-  return Binary.search(messages, messageID, (message) => message.id).found
+  return messages.some((message) => message.id === messageID)
+}
+
+function getMessage(draft: State, sessionID: string | undefined, messageID: string): Message | undefined {
+  const candidateLists = sessionID
+    ? [draft.message[sessionID]]
+    : Object.values(draft.message)
+  for (const messages of candidateLists) {
+    if (!messages) continue
+    const result = Binary.search(messages, messageID, (message) => message.id)
+    if (result.found) return messages[result.index]
+  }
+  return undefined
+}
+
+function isMessageCompleted(message: Message | undefined): boolean {
+  if (!message) return false
+  return Boolean(
+    (message as { finish?: unknown }).finish
+    || (message.time as { completed?: unknown } | undefined)?.completed,
+  )
+}
+
+function removeMessage(draft: State, sessionID: string | undefined, messageID: string): boolean {
+  if (!sessionID) return false
+  const messages = draft.message[sessionID]
+  if (!messages) return false
+  const result = Binary.search(messages, messageID, (message) => message.id)
+  if (!result.found) return false
+  const next = [...messages]
+  next.splice(result.index, 1)
+  draft.message[sessionID] = next
+  delete draft.part[messageID]
+  return true
 }
 
 export function reduceGlobalEvent(event: Event): GlobalEventResult {
@@ -296,6 +335,7 @@ export function applyDirectoryEvent(
       const info = props.info ?? (result.found ? sessions[result.index] : undefined)
       if (result.found) sessions.splice(result.index, 1)
       cleanupSessionCaches(draft, sessionID, callbacks?.onSetSessionTodo)
+      clearResponseIntegrity(sessionID)
       if (!info?.parentID) draft.sessionTotal = Math.max(0, draft.sessionTotal - 1)
       markSessionEvent(sessionID, true)
       return true
@@ -348,26 +388,34 @@ export function applyDirectoryEvent(
 
     case "message.updated": {
       const info = (event.properties as { info: Message }).info
+      if (isResponseMessageBlocked(info.sessionID, info.id)) {
+        return false
+      }
       const messages = draft.message[info.sessionID]
       if (!messages) {
         draft.message[info.sessionID] = [info]
         return true
       }
-      const result = Binary.search(messages, info.id, (m) => m.id)
-      if (result.found) {
+      const messageIndex = findMessageIndex(messages, info.id)
+      if (messageIndex >= 0) {
         // Skip message replacement if unchanged — preserves reference, avoids re-render
-        const existing = messages[result.index]
+        const existing = messages[messageIndex]
         const unchanged = areMessageUpdateFieldsEqual(existing, info)
         if (unchanged) {
           syncDebug.reducer.messageUpdatedUnchanged(info.sessionID, info.id, info.role, (info as { finish?: unknown }).finish, (info.time as { completed?: number })?.completed)
           return false
         }
         const next = [...messages]
-        next[result.index] = info
+        if (compareMessagesChronologically(existing, info) === 0) {
+          next[messageIndex] = info
+        } else {
+          next.splice(messageIndex, 1)
+          insertMessageChronologically(next, info)
+        }
         draft.message[info.sessionID] = next
       } else {
         const next = [...messages]
-        next.splice(result.index, 0, info)
+        insertMessageChronologically(next, info)
         draft.message[info.sessionID] = next
       }
       return true
@@ -378,9 +426,9 @@ export function applyDirectoryEvent(
       const messages = draft.message[props.sessionID]
       if (messages) {
         const next = [...messages]
-        const result = Binary.search(next, props.messageID, (m) => m.id)
-        if (result.found) {
-          next.splice(result.index, 1)
+        const messageIndex = findMessageIndex(next, props.messageID)
+        if (messageIndex >= 0) {
+          next.splice(messageIndex, 1)
           draft.message[props.sessionID] = next
         }
       }
@@ -398,11 +446,38 @@ export function applyDirectoryEvent(
       const messageID = (part as { messageID?: string }).messageID
       const sessionID = props.sessionID ?? (part as { sessionID?: string }).sessionID
       if (!messageID) return false
+      const owner = getMessage(draft, sessionID, messageID)
+      const existingParts = draft.part[messageID]
+
+      let nextPart = part
+      if (part.type === "text") {
+        const field = "text"
+        const rawValue = (part as Record<string, unknown>)[field]
+        if (typeof rawValue === "string") {
+          const sanitized = sanitizeResponseText(rawValue)
+          if (sanitized.polluted) {
+            if (sanitized.internalLeak && sanitized.text.length === 0) {
+              blockResponseMessage(sessionID, messageID)
+              return removeMessage(draft, sessionID, messageID)
+            }
+            nextPart = { ...part, [field]: sanitized.text } as Part
+          }
+        }
+      }
+
+      if (owner?.role === "assistant" && isMessageCompleted(owner)) {
+        const text = (nextPart as Record<string, unknown>).text
+        if (typeof text === "string" && isDuplicateCompletedResponse(sessionID, messageID, text)) {
+          return removeMessage(draft, sessionID, messageID)
+        }
+      }
+
+      const effectivePart = nextPart
       const missingOwningMessage = !hasMessage(draft, sessionID, messageID)
-      const parts = draft.part[messageID]
+      const parts = existingParts
       if (!parts) {
         syncDebug.reducer.partUpdatedNoExistingParts(messageID, part.id, part.type)
-        draft.part[messageID] = [part]
+        draft.part[messageID] = [effectivePart]
         return missingOwningMessage
           ? {
             changed: true,
@@ -411,30 +486,32 @@ export function applyDirectoryEvent(
           : true
       }
       const next = [...parts]
-      const result = Binary.search(next, part.id, (p) => p.id)
-      if (result.found) {
-        const previous = next[result.index]
-        if (shouldPreserveExistingPart(previous, part)) {
+      const partIndex = next.findIndex((candidate) => candidate.id === effectivePart.id)
+      if (partIndex >= 0) {
+        const previous = next[partIndex]
+        if (shouldPreserveExistingPart(previous, effectivePart)) {
           return false
         }
-        const dedupeFields = getUpdatedDeltaFields(previous, part)
-        next[result.index] = dedupeFields.length > 0
-          ? { ...part, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
-          : part
+        const dedupeFields = getUpdatedDeltaFields(previous, effectivePart)
+        next[partIndex] = dedupeFields.length > 0
+          ? { ...effectivePart, __dedupeNextDeltaFields: dedupeFields } as unknown as Part
+          : effectivePart
       } else {
         // Replace optimistic part (no sessionID) with server part of same type.
         // Gate: only scan if the first part lacks sessionID (optimistic parts are
         // always inserted first). Assistant messages never have optimistic parts,
         // so this check is effectively free during streaming.
         const hasOptimistic = next.length > 0 && !(next[0] as { sessionID?: string }).sessionID
-        const optimisticIdx = hasOptimistic && (part.type === "text" || part.type === "file")
-          ? next.findIndex((p) => p.type === part.type && !(p as { sessionID?: string }).sessionID)
+        const optimisticIdx = hasOptimistic && (effectivePart.type === "text" || effectivePart.type === "file")
+          ? next.findIndex((p) => p.type === effectivePart.type && !(p as { sessionID?: string }).sessionID)
           : -1
         if (optimisticIdx >= 0) {
-          next.splice(optimisticIdx, 1)
+          // Replace in place: pushing to the end reorders text/file parts of a
+          // just-sent message and remounts its rendered subtree.
+          next[optimisticIdx] = effectivePart
+        } else {
+          next.push(effectivePart)
         }
-        const insertResult = Binary.search(next, part.id, (p) => p.id)
-        next.splice(insertResult.index, 0, part)
       }
       draft.part[messageID] = next
       return missingOwningMessage
@@ -449,10 +526,10 @@ export function applyDirectoryEvent(
       const props = event.properties as { messageID: string; partID: string }
       const parts = draft.part[props.messageID]
       if (!parts) return false
-      const result = Binary.search(parts, props.partID, (p) => p.id)
-      if (result.found) {
+      const partIndex = parts.findIndex((part) => part.id === props.partID)
+      if (partIndex >= 0) {
         const next = [...parts]
-        next.splice(result.index, 1)
+        next.splice(partIndex, 1)
         if (next.length === 0) {
           delete draft.part[props.messageID]
         } else {
@@ -479,23 +556,39 @@ export function applyDirectoryEvent(
           materialization: { type: "incomplete-session-snapshot", reason: "orphan-delta", sessionID: props.sessionID, messageID: props.messageID, partID: props.partID },
         }
       }
-      const result = Binary.search(parts, props.partID, (p) => p.id)
-      if (!result.found) {
+      const partIndex = parts.findIndex((part) => part.id === props.partID)
+      if (partIndex < 0) {
         syncDebug.reducer.partDeltaNotFound(props.messageID, props.partID)
         return {
           changed: false,
           materialization: { type: "incomplete-session-snapshot", reason: "missing-delta-part", sessionID: props.sessionID, messageID: props.messageID, partID: props.partID },
         }
       }
-      const existing = parts[result.index] as Record<string, unknown>
+      const existing = parts[partIndex] as Record<string, unknown>
       const existingValue = existing[props.field] as string | undefined
+      const owner = getMessage(draft, props.sessionID, props.messageID)
+      if (isMessageCompleted(owner)) {
+        return false
+      }
       const dedupeFields = (existing as DedupeMetadata).__dedupeNextDeltaFields ?? []
       const shouldDedupe = dedupeFields.includes(props.field)
+      const sanitized = props.field === "text" || props.field === "output"
+        ? appendSanitizedDelta(existingValue, props.delta)
+        : { text: (existingValue ?? "") + props.delta, polluted: false, internalLeak: false }
+      if (sanitized.polluted && sanitized.text === existingValue) {
+        if (sanitized.internalLeak && sanitized.text.length === 0) {
+          blockResponseMessage(props.sessionID, props.messageID)
+          return removeMessage(draft, props.sessionID, props.messageID)
+        }
+        return false
+      }
       // Create new Part object + new array so React detects the change
       const next = [...parts]
-      next[result.index] = {
+      next[partIndex] = {
         ...existing,
-        [props.field]: shouldDedupe ? appendNonOverlappingDelta(existingValue, props.delta) : (existingValue ?? "") + props.delta,
+        [props.field]: shouldDedupe
+          ? appendNonOverlappingDelta(existingValue, props.delta)
+          : sanitized.text,
         __dedupeNextDeltaFields: dedupeFields.filter((field) => field !== props.field),
       } as unknown as Part
       draft.part[props.messageID] = next

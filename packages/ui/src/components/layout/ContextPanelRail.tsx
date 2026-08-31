@@ -35,7 +35,10 @@ import {
 import { cn } from '@/lib/utils';
 import { useFeatureFlagsStore } from '@/stores/useFeatureFlagsStore';
 import { useGitStatus } from '@/stores/useGitStore';
+import { useGitHubAuthStore } from '@/stores/useGitHubAuthStore';
+import { useLinearAuthStore } from '@/stores/useLinearAuthStore';
 import { normalizeContextPanelDirectoryKey, useUIStore } from '@/stores/useUIStore';
+import { ContextRailSurfacesDialog } from './ContextRailSurfacesDialog';
 
 const RAIL_TOOLTIP_DELAY_MS = 150;
 // Hold the surface-switch modifier for this long before revealing the order
@@ -120,7 +123,14 @@ const ContextPanelRailItem: React.FC<RailItemProps> = ({
             ) : displayBadgeCount ? (
               <span
                 aria-hidden="true"
-                className="absolute right-0 top-0 flex h-4 min-w-4 items-center justify-center rounded-full bg-surface-muted px-1 text-[0.625rem] font-medium leading-none text-muted-foreground"
+                // Muted digits on the muted surface sat at almost the same
+                // luminance as the glyph they overlap. The count is a live
+                // signal, so it takes the info tone on its own opaque chip.
+                className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.625rem] font-semibold leading-none"
+                style={{
+                  backgroundColor: 'var(--status-info-background)',
+                  color: 'var(--status-info)',
+                }}
               >
                 {displayBadgeCount}
               </span>
@@ -152,11 +162,18 @@ export const ContextPanelRail: React.FC = () => {
   const directoryKey = effectiveDirectory ? normalizeContextPanelDirectoryKey(effectiveDirectory) : '';
 
   const panelState = useUIStore((state) => (directoryKey ? state.contextPanelByDirectory[directoryKey] : undefined));
+  const workStatusPanelVisible = useUIStore((state) => state.workStatusPanelVisible);
   const contextRailOrder = useUIStore((state) => state.contextRailOrder);
+  const contextRailHiddenSurfaces = useUIStore((state) => state.contextRailHiddenSurfaces);
   const setContextRailOrder = useUIStore((state) => state.setContextRailOrder);
   const openContextSurface = useUIStore((state) => state.openContextSurface);
+  const closeContextPanel = useUIStore((state) => state.closeContextPanel);
   const shortcutOverrides = useUIStore((state) => state.shortcutOverrides);
   const planModeEnabled = useFeatureFlagsStore((state) => state.planModeEnabled);
+  const linearAuthChecked = useLinearAuthStore((state) => state.hasChecked);
+  const linearConnected = useLinearAuthStore((state) => state.status?.connected === true);
+  const githubAuthChecked = useGitHubAuthStore((state) => state.hasChecked);
+  const githubConnected = useGitHubAuthStore((state) => state.status?.connected === true);
   const { screenWidth } = useDeviceInfo();
   const gitStatus = useGitStatus(directoryKey || null);
 
@@ -248,12 +265,33 @@ export const ContextPanelRail: React.FC = () => {
   const surfaces = React.useMemo(() => {
     return getVisibleContextRailSurfaces({
       railOrder: contextRailOrder,
+      hiddenSurfaces: contextRailHiddenSurfaces,
       planModeEnabled,
       isVSCode: isVSCodeRuntime(),
       screenWidth,
       tabs,
+      linearConnected,
+      githubConnected,
     });
-  }, [contextRailOrder, planModeEnabled, screenWidth, tabs]);
+  }, [contextRailHiddenSurfaces, contextRailOrder, githubConnected, linearConnected, planModeEnabled, screenWidth, tabs]);
+
+  // A surface whose integration disconnected closes rather than lingering as
+  // an active panel with no rail icon.
+  React.useEffect(() => {
+    if (!directoryKey || !linearAuthChecked || linearConnected || activeMode !== 'linear') {
+      return;
+    }
+    closeContextPanel(directoryKey);
+  }, [activeMode, closeContextPanel, directoryKey, linearAuthChecked, linearConnected]);
+
+  React.useEffect(() => {
+    if (!directoryKey || !githubAuthChecked || githubConnected || activeMode !== 'pr') {
+      return;
+    }
+    closeContextPanel(directoryKey);
+  }, [activeMode, closeContextPanel, directoryKey, githubAuthChecked, githubConnected]);
+
+  const [isSurfacesDialogOpen, setIsSurfacesDialogOpen] = React.useState(false);
 
   const handleDragEnd = React.useCallback((event: DragEndEvent) => {
     const { active, over } = event;
@@ -286,7 +324,9 @@ export const ContextPanelRail: React.FC = () => {
             const label = t(surface.labelKey);
             // Git shows a numeric badge instead of the old activity dot.
             // Other surfaces never inherit git's changed-files signal.
-            const gitChangedCount = surface.id === 'git' ? changedFilesCount : 0;
+            // The work-status panel reports the same count in words a few
+            // pixels away; two live counts for one fact is one too many.
+            const gitChangedCount = surface.id === 'git' && !workStatusPanelVisible ? changedFilesCount : 0;
             const badgeCount = gitChangedCount > 0 ? gitChangedCount : null;
             return (
               <ContextPanelRailItem
@@ -321,6 +361,24 @@ export const ContextPanelRail: React.FC = () => {
           })}
         </SortableContext>
       </DndContext>
+      {/* Outside the sortable list on purpose: this button takes no digit,
+          cannot be dragged, and configures the rail rather than living on it. */}
+      <Tooltip delayDuration={RAIL_TOOLTIP_DELAY_MS}>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label={t('contextRail.configure.open')}
+            onClick={() => setIsSurfacesDialogOpen(true)}
+            className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:text-foreground"
+          >
+            <Icon name="equalizer-2" className="h-[18px] w-[18px]" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="left" sideOffset={8}>
+          {t('contextRail.configure.open')}
+        </TooltipContent>
+      </Tooltip>
+      <ContextRailSurfacesDialog open={isSurfacesDialogOpen} onOpenChange={setIsSurfacesDialogOpen} />
     </nav>
   );
 };

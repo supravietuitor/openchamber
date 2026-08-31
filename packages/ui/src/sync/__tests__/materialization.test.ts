@@ -12,6 +12,10 @@ function message(id: string, sessionID = "ses_1"): Message {
   return { id, sessionID, role: "assistant", time: { created: 1 } } as Message
 }
 
+function completedMessage(id: string, parentID: string, sessionID = "ses_1"): Message {
+  return { id, sessionID, role: "assistant", parentID, time: { created: 1, completed: 2 } } as Message
+}
+
 function userMessage(id: string, sessionID = "ses_1"): Message {
   return { id, sessionID, role: "user", time: { created: 1 } } as Message
 }
@@ -55,6 +59,21 @@ describe("materializeSessionSnapshots", () => {
     expect(result.part.msg_1.map((item) => item.id)).toEqual(["prt_1"])
     expect(result.messagesChanged).toBe(true)
     expect(result.partsChanged).toBe(true)
+  })
+
+  test("filters completed exact assistant duplicates with the same parent", () => {
+    const result = materializeSessionSnapshots(
+      { message: {}, part: {} },
+      "ses_1",
+      [
+        { info: completedMessage("msg_1", "user_1"), parts: [part("prt_1", "msg_1", "text", "same answer")] },
+        { info: completedMessage("msg_2", "user_1"), parts: [part("prt_2", "msg_2", "text", "same answer")] },
+        { info: completedMessage("msg_3", "user_2"), parts: [part("prt_3", "msg_3", "text", "same answer")] },
+      ],
+    )
+
+    expect(result.messages.map((item) => item.id)).toEqual(["msg_1", "msg_3"])
+    expect(result.part.msg_2).toBe(undefined)
   })
 
   test("preserves unchanged references", () => {
@@ -117,6 +136,62 @@ describe("materializeSessionSnapshots", () => {
     )
 
     expect(result.part.msg_1[0]).toBe(livePart)
+  })
+
+  test("preserves a locally aborted assistant message when a stale unfinished snapshot arrives", () => {
+    const unfinishedMessage = message("msg_1")
+    if (unfinishedMessage.role !== "assistant") throw new Error("Expected assistant fixture")
+    const abortedMessage: Message = {
+      ...unfinishedMessage,
+      time: { created: 1, completed: 5000 },
+      error: { name: "MessageAbortedError", data: { message: "aborted" } },
+    }
+    const staleMessage = message("msg_1")
+    const state = {
+      message: { ses_1: [abortedMessage] },
+      part: { msg_1: [] },
+    }
+
+    const result = materializeSessionSnapshots(
+      state,
+      "ses_1",
+      [{ info: staleMessage, parts: [] }],
+    )
+
+    expect(result.message).toBe(state.message)
+    expect(result.message.ses_1[0]).toBe(abortedMessage)
+    expect(result.message.ses_1[0]).not.toBe(staleMessage)
+  })
+
+  test("replaces a locally aborted assistant message with the authoritative completed snapshot", () => {
+    const unfinishedMessage = message("msg_1")
+    if (unfinishedMessage.role !== "assistant") throw new Error("Expected assistant fixture")
+    const abortedMessage: Message = {
+      ...unfinishedMessage,
+      time: { created: 1, completed: 5000 },
+      error: { name: "MessageAbortedError", data: { message: "aborted" } },
+    }
+    const completedMessage: Message = {
+      ...unfinishedMessage,
+      time: { created: 1, completed: 4000 },
+    }
+    const state = {
+      message: { ses_1: [abortedMessage] },
+      part: { msg_1: [] },
+    }
+
+    const result = materializeSessionSnapshots(
+      state,
+      "ses_1",
+      [{ info: completedMessage, parts: [] }],
+    )
+
+    const reconciled = result.message.ses_1[0]
+    expect(reconciled).toBe(completedMessage)
+    expect(reconciled?.role).toBe("assistant")
+    if (reconciled?.role !== "assistant") throw new Error("Expected assistant result")
+    expect("error" in reconciled).toBe(false)
+    expect(reconciled.time.completed).toBe(4000)
   })
 
   test("does not preserve omitted optimistic user text parts beside server snapshot parts", () => {

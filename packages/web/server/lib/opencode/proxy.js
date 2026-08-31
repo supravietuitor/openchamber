@@ -1,3 +1,6 @@
+import http from 'node:http';
+import https from 'node:https';
+
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
 import {
@@ -10,6 +13,96 @@ import { DEFAULT_UPSTREAM_STALL_TIMEOUT_MS } from '../event-stream/upstream-read
 import { recordStartupPerformance } from './startup-performance.js';
 
 const DEFAULT_SSE_HEARTBEAT_INTERVAL_MS = 20_000;
+
+const OPENCODE_AGENT_KEEP_ALIVE_MS = 30_000;
+// Node's own default. A lower cap evicts pooled sockets under concurrency,
+// which reintroduces exactly the per-request connection churn this agent
+// exists to prevent (measured: at 64 concurrent requests, a cap of 32 left
+// 303 sockets in TIME_WAIT versus 0 at 256).
+const OPENCODE_AGENT_MAX_FREE_SOCKETS = 256;
+// Evicts idle free sockets from our side. Without it the only thing that
+// retires an idle pooled socket is the upstream closing it. Note this is
+// distinct from `keepAliveMsecs`, which is the TCP keep-alive probe delay.
+const OPENCODE_AGENT_IDLE_TIMEOUT_MS = 60_000;
+
+const OPENCODE_AGENT_OPTIONS = {
+  keepAlive: true,
+  keepAliveMsecs: OPENCODE_AGENT_KEEP_ALIVE_MS,
+  maxSockets: Infinity,
+  maxFreeSockets: OPENCODE_AGENT_MAX_FREE_SOCKETS,
+  timeout: OPENCODE_AGENT_IDLE_TIMEOUT_MS,
+};
+
+const isHttpsProxyTarget = (target) => {
+  if (typeof target !== 'string') {
+    return false;
+  }
+  try {
+    return new URL(target).protocol === 'https:';
+  } catch {
+    return /^https:/i.test(target.trim());
+  }
+};
+
+/**
+ * Agent for proxied OpenCode API requests.
+ *
+ * When no agent is supplied, `http-proxy` falls back to `agent: false`, which
+ * both disables connection pooling and forces `Connection: close` on every
+ * proxied request (http-proxy/lib/http-proxy/common.js). That consumes one
+ * ephemeral port per request, and sustained traffic can exhaust the host's
+ * ephemeral port range — after which every process on the machine fails to
+ * open outbound connections with EADDRNOTAVAIL.
+ *
+ * The agent must match the target scheme: http-proxy dispatches through
+ * `https.request` when `target.protocol === 'https:'`
+ * (http-proxy/lib/http-proxy/passes/web-incoming.js), and an `http.Agent`
+ * would open a plaintext socket to a TLS port. External servers may be
+ * configured over https via `OPENCODE_HOST` (see env-config.js), so derive the
+ * agent class from the resolved target.
+ *
+ * `maxSockets: Infinity` preserves the unbounded concurrency of `agent: false`,
+ * so this changes connection reuse only, not request throughput.
+ */
+export const createOpenCodeProxyAgent = (target) => (
+  isHttpsProxyTarget(target)
+    ? new https.Agent(OPENCODE_AGENT_OPTIONS)
+    : new http.Agent(OPENCODE_AGENT_OPTIONS)
+);
+
+/**
+ * Lazily resolves the proxy agent, memoized per scheme.
+ *
+ * The scheme cannot be decided at registration time: `setupProxy()` runs before
+ * `bootstrapOpenCodeAtStartup()` (startup-pipeline-runtime.js), so on a cold
+ * start `state.openCodePort` is still null, `buildOpenCodeUrl()` throws
+ * (network-runtime.js) and `resolveProxyTarget()` falls back to the http
+ * loopback default. An external server configured over https via
+ * `OPENCODE_HOST` only becomes visible on `state.openCodeBaseUrl` after
+ * bootstrap completes.
+ *
+ * http-proxy-middleware rebuilds its per-request options with
+ * `Object.assign({}, this.proxyOptions)` inside `prepareProxyRequest`, which
+ * invokes getters, so exposing `agent` as a getter defers resolution to request
+ * time. Memoizing per scheme keeps a single shared pool per scheme rather than
+ * allocating an agent per request.
+ */
+const createOpenCodeProxyAgentResolver = (resolveTarget) => {
+  const agents = new Map();
+
+  return () => {
+    const target = resolveTarget();
+    const scheme = isHttpsProxyTarget(target) ? 'https:' : 'http:';
+    let agent = agents.get(scheme);
+    if (!agent) {
+      // Construct through the shared factory rather than inline, so both
+      // schemes are built from OPENCODE_AGENT_OPTIONS by the same code path.
+      agent = createOpenCodeProxyAgent(target);
+      agents.set(scheme, agent);
+    }
+    return agent;
+  };
+};
 
 export const createDirectoryQueryCanonicalizer = ({ realpath, ...cacheOptions } = {}) => {
   const realpathCache = createRealpathCache({ fallbackOnError: true, realpath, ...cacheOptions });
@@ -285,15 +378,22 @@ export const registerOpenCodeProxy = (app, deps) => {
   // and direct fetch helpers use. This avoids split-brain state where /health
   // succeeds against an external host but /api/* still proxies to 127.0.0.1.
   const resolveProxyTarget = () => {
-    try {
-      const resolved = normalizeProxyTarget(buildOpenCodeUrl('/', ''));
-      if (resolved) {
-        return resolved;
+    const runtimeState = getRuntime();
+
+    // `buildOpenCodeUrl` throws while the port is unknown, and the port is
+    // nulled on several runtime paths (health-check failure, failed restart),
+    // not just cold start. Checking first keeps a degraded OpenCode from
+    // making every proxied request pay for a thrown-and-caught exception.
+    if (runtimeState.openCodePort) {
+      try {
+        const resolved = normalizeProxyTarget(buildOpenCodeUrl('/', ''));
+        if (resolved) {
+          return resolved;
+        }
+      } catch {
       }
-    } catch {
     }
 
-    const runtimeState = getRuntime();
     const externalBase = normalizeProxyTarget(runtimeState.openCodeBaseUrl);
     if (externalBase) {
       return externalBase;
@@ -308,6 +408,8 @@ export const registerOpenCodeProxy = (app, deps) => {
 
   const PROXY_REQUEST_TIMEOUT_MS = normalizeProxyTimeout(LONG_REQUEST_TIMEOUT_MS);
   const PROXY_TIMEOUT_MARKER = Symbol('openchamberProxyTimedOut');
+  const PROMPT_IDEMPOTENCY_TTL_MS = 15 * 60 * 1000;
+  const acceptedPromptIDs = new Map();
 
   // A provider OAuth callback blocks upstream for as long as the user takes to
   // sign in in their browser (device-code polling, or a loopback redirect), so
@@ -767,8 +869,18 @@ export const registerOpenCodeProxy = (app, deps) => {
   });
 
   // Generic proxy for non-SSE OpenCode API routes.
+  // The agent is exposed as a getter so its class is resolved per request, not
+  // at registration: the proxy is registered before OpenCode bootstraps, so an
+  // https target configured via OPENCODE_HOST is not yet visible here. Agents
+  // are memoized per scheme, so this is still one shared pool per scheme across
+  // `apiProxy` and `interactiveOAuthProxy`.
+  const resolveOpenCodeProxyAgent = createOpenCodeProxyAgentResolver(resolveProxyTarget);
+
   const createApiProxy = (timeoutMs) => createProxyMiddleware({
     target: resolveProxyTarget(),
+    get agent() {
+      return resolveOpenCodeProxyAgent();
+    },
     changeOrigin: true,
     pathRewrite: { '^/api': '' },
     timeout: timeoutMs,
@@ -822,6 +934,67 @@ export const registerOpenCodeProxy = (app, deps) => {
   const apiProxy = createApiProxy(PROXY_REQUEST_TIMEOUT_MS);
   const interactiveOAuthProxy = createApiProxy(INTERACTIVE_OAUTH_TIMEOUT_MS);
 
+  // A transport timeout is ambiguous: the upstream prompt may already be
+  // running even though the browser did not receive its response. Keep the
+  // client-generated message ID claimed for a bounded window so a retry cannot
+  // start a second turn. Requests without messageID are background/internal
+  // continuations and intentionally remain outside this gate.
+  const promptIdempotencyGate = (req, res, next) => {
+    const messageID = typeof req.body?.messageID === 'string' ? req.body.messageID.trim() : '';
+    const sessionID = typeof req.params?.sessionID === 'string' ? req.params.sessionID : '';
+    if (!messageID || !sessionID) return next();
+
+    const directory = typeof req.headers?.['x-opencode-directory'] === 'string'
+      ? req.headers['x-opencode-directory']
+      : '';
+    const key = `${sessionID}\u0000${directory}\u0000${messageID}`;
+    const now = Date.now();
+    const existing = acceptedPromptIDs.get(key);
+    if (existing && existing > now) {
+      return res.status(202).json({ messageID, deduplicated: true });
+    }
+
+    const claim = now + PROMPT_IDEMPOTENCY_TTL_MS;
+    acceptedPromptIDs.set(key, claim);
+    const remember = () => {
+      acceptedPromptIDs.set(key, claim);
+      const timer = setTimeout(() => {
+        if (acceptedPromptIDs.get(key) === claim) acceptedPromptIDs.delete(key);
+      }, PROMPT_IDEMPOTENCY_TTL_MS);
+      timer.unref?.();
+    };
+
+    // Recover the claim after a proxy restart. The upstream has already
+    // persisted the user message when a previous prompt request was accepted.
+    // A failed probe is deliberately fail-open: it must not turn a temporary
+    // upstream read outage into a lost user send.
+    const encodedSessionID = encodeURIComponent(sessionID);
+    const encodedMessageID = encodeURIComponent(messageID);
+    const messageURL = buildOpenCodeUrl(`/session/${encodedSessionID}/message/${encodedMessageID}`, '')
+      + (directory ? `?directory=${encodeURIComponent(directory)}` : '');
+    fetch(messageURL, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        ...getOpenCodeAuthHeaders(),
+        ...(directory ? { 'x-opencode-directory': directory } : {}),
+      },
+      signal: AbortSignal.timeout(1500),
+    }).then((probe) => {
+      if (probe.ok && !res.headersSent && !res.writableEnded) {
+        remember();
+        res.status(202).json({ messageID, deduplicated: true });
+        return;
+      }
+      remember();
+      next();
+    }).catch(() => {
+      remember();
+      next();
+    });
+    return undefined;
+  };
+
   // Best-effort fallback for stale clients still sending symlink paths.
   // Settings and project selection normalize at source; this cached async path
   // avoids blocking the proxy hot path on every directory-scoped request.
@@ -838,6 +1011,11 @@ export const registerOpenCodeProxy = (app, deps) => {
   });
 
   app.use('/api', applyProxyResponseDeadline);
+  app.post('/api/session/:sessionID/prompt_async', promptIdempotencyGate);
   app.post('/api/provider/:providerID/oauth/callback', interactiveOAuthProxy);
+  // OpenCode's native MCP OAuth flow: the request blocks until the user
+  // finishes authorization in the browser (up to OpenCode's 5-minute callback
+  // timeout), so it needs the interactive-OAuth deadline, not the default one.
+  app.post('/api/mcp/:name/auth/authenticate', interactiveOAuthProxy);
   app.use('/api', apiProxy);
 };

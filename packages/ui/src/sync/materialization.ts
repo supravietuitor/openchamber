@@ -1,8 +1,8 @@
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 import { mergeMessages } from "./optimistic"
 import type { SessionMaterializationReason } from "./event-reducer"
+import { sortMessagesChronologically } from "./message-ordering"
 
-const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 const STREAMING_PART_FIELDS = ["text", "output"] as const
 const ACTIVE_TOOL_STATUSES = new Set(["pending", "running"])
 const FINAL_TOOL_STATUSES = new Set(["completed", "error", "aborted", "failed", "timeout", "cancelled"])
@@ -93,10 +93,42 @@ export function getStaleRunningToolMessageID(
   return undefined
 }
 
-function sortParts(parts: Part[], skipPartTypes: ReadonlySet<string>) {
+function filterMaterializedParts(parts: Part[], skipPartTypes: ReadonlySet<string>): Part[] {
   return parts
     .filter((part) => !!part?.id && !skipPartTypes.has(part.type))
-    .sort((a, b) => cmp(a.id, b.id))
+}
+
+function completedAssistantDuplicateKey(message: Message, parts: Part[]): string | undefined {
+  if (message.role !== "assistant" || !(message.time?.completed && message.time.completed > 0)) return undefined
+  const parentID = typeof message.parentID === "string" ? message.parentID : ""
+  if (!parentID) return undefined
+  const text = parts
+    .filter((part) => part.type === "text")
+    .map((part) => String((part as { text?: unknown }).text ?? "").replace(/\r\n/g, "\n").trim())
+    .filter(Boolean)
+    .join("\n")
+  if (!text) return undefined
+  return `${parentID}\u0000${text}`
+}
+
+function removeMaterializedAssistantDuplicates(
+  messages: Message[],
+  partState: Record<string, Part[]>,
+): { messages: Message[]; part: Record<string, Part[]>; changed: boolean } {
+  const seen = new Set<string>()
+  const duplicateIDs = new Set<string>()
+  for (const message of messages) {
+    const key = completedAssistantDuplicateKey(message, partState[message.id] ?? [])
+    if (!key) continue
+    if (seen.has(key)) duplicateIDs.add(message.id)
+    else seen.add(key)
+  }
+  if (duplicateIDs.size === 0) return { messages, part: partState, changed: false }
+
+  const nextMessages = messages.filter((message) => !duplicateIDs.has(message.id))
+  const nextPart = { ...partState }
+  for (const messageID of duplicateIDs) delete nextPart[messageID]
+  return { messages: nextMessages, part: nextPart, changed: true }
 }
 
 function haveEquivalentPartSnapshots(left: Part[] | undefined, right: Part[]): boolean {
@@ -252,7 +284,7 @@ function mergeMaterializedParts(
   )
   if (missingLiveParts.length === 0) return mergedParts
 
-  return [...mergedParts, ...missingLiveParts].sort((a, b) => cmp(a.id, b.id))
+  return [...mergedParts, ...missingLiveParts]
 }
 
 export function materializeSessionSnapshots(
@@ -262,14 +294,31 @@ export function materializeSessionSnapshots(
   options: MaterializeSessionSnapshotsOptions = {},
 ): MaterializeSessionSnapshotsResult {
   const skipPartTypes = options.skipPartTypes ?? new Set<string>()
-  const snapshots = records
-    .filter((record) => !!record?.info?.id)
-    .sort((left, right) => cmp(left.info.id, right.info.id))
-  const nextMessages = snapshots.map((record) => record.info)
+  const recordsByMessageID = new Map(
+    records
+      .filter((record) => !!record?.info?.id)
+      .map((record) => [record.info.id, record] as const),
+  )
+  const nextMessages = sortMessagesChronologically([...recordsByMessageID.values()].map((record) => record.info))
+  const snapshots = nextMessages.map((message) => recordsByMessageID.get(message.id)!)
   const existingMessages = state.message[sessionID]
   const currentMessages = existingMessages ?? []
-  const messages = mergeMessages(currentMessages, nextMessages)
-  const messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
+  const incomingByID = new Map(nextMessages.map((message) => [message.id, message] as const))
+  let reconciledCurrentMessages = currentMessages
+  for (let index = 0; index < currentMessages.length; index += 1) {
+    const existing = currentMessages[index]
+    const incoming = incomingByID.get(existing.id)
+    if (
+      existing.role !== "assistant"
+      || existing.error?.name !== "MessageAbortedError"
+      || incoming?.role !== "assistant"
+      || incoming.time.completed === undefined
+    ) continue
+    if (reconciledCurrentMessages === currentMessages) reconciledCurrentMessages = [...currentMessages]
+    reconciledCurrentMessages[index] = incoming
+  }
+  let messages = mergeMessages(reconciledCurrentMessages, nextMessages)
+  let messagesChanged = messages !== currentMessages || (existingMessages === undefined && snapshots.length === 0)
 
   let partsChanged = false
   let nextPartState = state.part
@@ -283,7 +332,7 @@ export function materializeSessionSnapshots(
     const existing = nextPartState[messageID]
     const nextParts = mergeMaterializedParts(
       existing,
-      sortParts(record.parts ?? [], skipPartTypes),
+      filterMaterializedParts(record.parts ?? [], skipPartTypes),
       skipPartTypes,
       isAssistant,
     )
@@ -306,6 +355,14 @@ export function materializeSessionSnapshots(
       // the ensure-renderable effects retry syncSession forever.
       nextPartState[messageID] = nextParts
     }
+    partsChanged = true
+  }
+
+  const duplicateResult = removeMaterializedAssistantDuplicates(messages, nextPartState)
+  if (duplicateResult.changed) {
+    messages = duplicateResult.messages
+    nextPartState = duplicateResult.part
+    messagesChanged = true
     partsChanged = true
   }
 
