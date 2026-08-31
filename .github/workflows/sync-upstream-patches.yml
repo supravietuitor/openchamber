@@ -75,6 +75,10 @@ jobs:
           UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           set -euo pipefail
+          # Keep the v1.21.1 patch base available when this bootstrap workflow
+          # first runs from the old fork main branch. Later releases can use
+          # the previous synchronization branch in the same way.
+          git fetch --no-tags origin adapt-v1.21.1 || true
           git fetch --no-tags "$UPSTREAM_REPOSITORY" "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
           git switch --detach "$UPSTREAM_TAG"
           cp -R "$RUNNER_TEMP/openchamber-patches" fork-patches
