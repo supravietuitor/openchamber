@@ -140,3 +140,19 @@ git apply --check fork-patches/0003-response-integrity-dedup-idempotency.patch
 - 三个补丁在全新 `v1.21.1` worktree 中按顺序重放：通过
 
 发布前仍应在目标 Windows 构建环境执行完整 Electron 打包和人工下载验证；本说明中的测试不等同于安装包验收。
+
+## 自动跟随上游
+
+`.github/workflows/sync-upstream-patches.yml` 提供自动同步流程：
+
+- 每日 UTC `02:17` 查询 `openchamber/openchamber` 的最新 `v*` tag。
+- 也可在 GitHub Actions 中手动运行，并填写 `upstream_tag`，例如 `v1.22.0`。
+- 流程从指定上游 tag 建立 `auto-upstream-sync` 分支，按 `0001 → 0002 → 0003` 应用补丁。
+- 补丁冲突、类型检查或聚焦测试失败时，workflow 失败并停止，不会推送可合并结果。
+- 验证成功后强制更新同名同步分支，并创建或更新面向 `main` 的 PR；不会自动合并。
+
+首次启用需要先把本文件和 workflow 合并到 fork 的默认 `main` 分支，因为 GitHub 的定时 workflow 只从默认分支读取调度配置。之后的手动触发路径为：
+
+`Actions → Sync upstream patches → Run workflow → upstream_tag=v1.22.0`
+
+`skip_tests` 仅用于诊断补丁冲突，不应作为正常发布流程的选项。
