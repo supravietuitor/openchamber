@@ -78,7 +78,21 @@ const readBinaryVersion = (binaryPath) => {
     windowsHide: true,
   });
   if (result.status !== 0) return null;
-  return (result.stdout || '').trim().split(/\s+/)[0] || null;
+  return (result.stdout || '').trim().split(/\s+/)[0]?.replace(/^v/, '') || null;
+};
+
+const stageCustomBinary = (source, destination, expectedVersion) => {
+  if (!fs.existsSync(source)) {
+    throw new Error(`Custom OpenCode CLI not found: ${source}`);
+  }
+  const actualVersion = readBinaryVersion(source);
+  if (actualVersion !== expectedVersion) {
+    throw new Error(`Custom OpenCode CLI version mismatch: expected ${expectedVersion}, got ${actualVersion || 'unknown'}`);
+  }
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination);
+  ensureExecutable(destination);
+  console.log(`[electron] staged custom OpenCode CLI: ${source} -> ${destination}`);
 };
 
 const ensureExecutable = (filePath) => {
@@ -148,6 +162,11 @@ const main = async () => {
   const targetArchitecture = resolveTargetArchitecture();
   const artifact = artifactForPlatform(process.platform, targetArchitecture);
   const outputBinary = outputBinaryPath(artifact.binary);
+  const customBinary = process.env.OPENCHAMBER_OPENCODE_CLI_PATH;
+  if (customBinary) {
+    stageCustomBinary(path.resolve(customBinary), outputBinary, version);
+    return;
+  }
   const existingVersion = readBinaryVersion(outputBinary);
   if (existingVersion === version) {
     console.log(`[electron] bundled OpenCode CLI already prepared: ${outputBinary} (${version})`);
