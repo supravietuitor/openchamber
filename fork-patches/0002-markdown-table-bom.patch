@@ -1,0 +1,13 @@
+diff --git a/packages/ui/src/components/chat/markdown/decorate.ts b/packages/ui/src/components/chat/markdown/decorate.ts
+index 1ab6a6bdc..60b6dd1ef 100644
+--- a/packages/ui/src/components/chat/markdown/decorate.ts
++++ b/packages/ui/src/components/chat/markdown/decorate.ts
+@@ -524,7 +524,7 @@ export const decorateMarkdown = (root: HTMLElement, ctx: DecorateContext): void
+ // ---------------------------------------------------------------------------
+ 
+ const downloadBlob = (filename: string, content: string, mime: string): void => {
+-  const blob = new Blob([content], { type: mime });
++  const blob = new Blob([(mime.startsWith('text/') ? '\uFEFF' : '') + content], { type: mime });
+   const url = URL.createObjectURL(blob);
+   const link = document.createElement('a');
+   link.href = url;

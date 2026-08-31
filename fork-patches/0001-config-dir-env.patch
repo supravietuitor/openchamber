@@ -1,0 +1,15 @@
+diff --git a/packages/web/server/lib/opencode/shared.js b/packages/web/server/lib/opencode/shared.js
+index d01168f37..933396bbd 100644
+--- a/packages/web/server/lib/opencode/shared.js
++++ b/packages/web/server/lib/opencode/shared.js
+@@ -6,7 +6,9 @@ import { parse as parseJsonc, printParseErrorCode } from 'jsonc-parser';
+ 
+ // ============== PATH CONSTANTS ==============
+ 
+-const OPENCODE_CONFIG_DIR = path.join(os.homedir(), '.config', 'opencode');
++const OPENCODE_CONFIG_DIR = process.env.OPENCODE_CONFIG_DIR
++  ? path.resolve(process.env.OPENCODE_CONFIG_DIR)
++  : path.join(os.homedir(), '.config', 'opencode');
+ const AGENT_DIR = path.join(OPENCODE_CONFIG_DIR, 'agents');
+ const COMMAND_DIR = path.join(OPENCODE_CONFIG_DIR, 'commands');
+ const SKILL_DIR = path.join(OPENCODE_CONFIG_DIR, 'skills');
