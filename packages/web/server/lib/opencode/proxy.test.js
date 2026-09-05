@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
+import path from 'node:path';
 
+import express from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import { describe, expect, it } from 'vitest';
 
@@ -8,6 +10,7 @@ import {
   createDirectoryQueryCanonicalizer,
   createOpenCodeProxyAgent,
   normalizeForwardedDirectoryHeaders,
+  registerOpenCodeProxy,
 } from './proxy.js';
 
 describe('createDirectoryQueryCanonicalizer', () => {
@@ -247,6 +250,114 @@ describe('createOpenCodeProxyAgent', () => {
       agent.destroy();
       await closeServer(front);
       await closeServer(upstream);
+    }
+  });
+});
+
+describe('prompt idempotency', () => {
+  const listenServer = (app) => new Promise((resolve, reject) => {
+    const server = app.listen(0, '127.0.0.1', () => resolve(server));
+    server.once('error', reject);
+  });
+
+  it('does not forward a duplicate prompt_async request with the same messageID', async () => {
+    let upstreamCalls = 0;
+    const upstream = express();
+    upstream.post('/session/abc/prompt_async', express.json(), async (_req, res) => {
+      upstreamCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      res.json({ accepted: true });
+    });
+    const upstreamServer = await listenServer(upstream);
+    const upstreamPort = upstreamServer.address().port;
+
+    const app = express();
+    app.use('/api', express.json());
+    registerOpenCodeProxy(app, {
+      fs: {},
+      os: {},
+      path,
+      OPEN_CODE_READY_GRACE_MS: 0,
+      getRuntime: () => ({
+        openCodePort: upstreamPort,
+        openCodeBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+        isOpenCodeReady: true,
+        openCodeNotReadySince: 0,
+        isRestartingOpenCode: false,
+      }),
+      getOpenCodeAuthHeaders: () => ({}),
+      buildOpenCodeUrl: (requestPath) => `http://127.0.0.1:${upstreamPort}${requestPath}`,
+      ensureOpenCodeApiPrefix: () => {},
+    });
+    const proxyServer = await listenServer(app);
+    const proxyPort = proxyServer.address().port;
+    const sendPrompt = () => fetch(`http://127.0.0.1:${proxyPort}/api/session/abc/prompt_async`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messageID: 'msg_same', parts: [{ type: 'text', text: 'hello' }] }),
+    });
+
+    try {
+      const first = sendPrompt();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const second = await sendPrompt();
+      const firstResponse = await first;
+
+      expect(firstResponse.status).toBe(200);
+      expect(second.status).toBe(202);
+      expect(await second.json()).toMatchObject({ messageID: 'msg_same', deduplicated: true });
+      expect(upstreamCalls).toBe(1);
+    } finally {
+      await closeServer(proxyServer);
+      await closeServer(upstreamServer);
+    }
+  });
+
+  it('recovers the idempotency claim from an already persisted upstream message', async () => {
+    let upstreamPosts = 0;
+    const upstream = express();
+    upstream.get('/session/abc/message/msg_existing', (_req, res) => res.json({ info: { id: 'msg_existing' } }));
+    upstream.post('/session/abc/prompt_async', express.json(), (_req, res) => {
+      upstreamPosts += 1;
+      res.json({ accepted: true });
+    });
+    const upstreamServer = await listenServer(upstream);
+    const upstreamPort = upstreamServer.address().port;
+
+    const app = express();
+    app.use('/api', express.json());
+    registerOpenCodeProxy(app, {
+      fs: {},
+      os: {},
+      path,
+      OPEN_CODE_READY_GRACE_MS: 0,
+      getRuntime: () => ({
+        openCodePort: upstreamPort,
+        openCodeBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+        isOpenCodeReady: true,
+        openCodeNotReadySince: 0,
+        isRestartingOpenCode: false,
+      }),
+      getOpenCodeAuthHeaders: () => ({}),
+      buildOpenCodeUrl: (requestPath) => `http://127.0.0.1:${upstreamPort}${requestPath}`,
+      ensureOpenCodeApiPrefix: () => {},
+    });
+    const proxyServer = await listenServer(app);
+    const proxyPort = proxyServer.address().port;
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/api/session/abc/prompt_async`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messageID: 'msg_existing', parts: [{ type: 'text', text: 'hello' }] }),
+      });
+
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ messageID: 'msg_existing', deduplicated: true });
+      expect(upstreamPosts).toBe(0);
+    } finally {
+      await closeServer(proxyServer);
+      await closeServer(upstreamServer);
     }
   });
 });

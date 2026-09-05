@@ -524,7 +524,7 @@ export const decorateMarkdown = (root: HTMLElement, ctx: DecorateContext): void 
 // ---------------------------------------------------------------------------
 
 const downloadBlob = (filename: string, content: string, mime: string): void => {
-  const blob = new Blob([content], { type: mime });
+  const blob = new Blob([(mime.startsWith('text/') ? '\uFEFF' : '') + content], { type: mime });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
